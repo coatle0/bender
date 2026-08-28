@@ -1,49 +1,67 @@
-"""Tests for the Codex CLI subprocess wrapper."""
+"""Tests for the long-lived Codex app-server subprocess wrapper."""
 
-import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from codex_app_server_sdk.errors import (
+    CodexProtocolError,
+    CodexTimeoutError,
+    CodexTransportError,
+)
 
 from bender.codex_process import CODEX_EXECUTABLE, CodexProcess, CodexProcessError
 
 
-def _fake_process(stdout: bytes, stderr: bytes = b"", returncode: int = 0) -> MagicMock:
-    proc = MagicMock()
-    proc.communicate = AsyncMock(return_value=(stdout, stderr))
-    proc.returncode = returncode
-    proc.kill = MagicMock()
-    proc.wait = AsyncMock(return_value=returncode)
-    return proc
+def _fake_client(**chat_once_results: object) -> MagicMock:
+    """A fake CodexClient. `chat_once_results` is unused directly; tests
+    configure `client.chat_once.side_effect` / `.return_value` themselves."""
+    client = MagicMock()
+    client.start = AsyncMock()
+    client.initialize = AsyncMock()
+    client.chat_once = AsyncMock()
+    client.close = AsyncMock()
+    return client
 
 
-def _thread_started(thread_id: str) -> bytes:
-    return (json.dumps({"type": "thread.started", "thread_id": thread_id}) + "\n").encode()
-
-
-def _agent_message(text: str) -> bytes:
-    item = {"id": "item_0", "type": "agent_message", "text": text}
-    payload = {"type": "item.completed", "item": item}
-    return (json.dumps(payload) + "\n").encode()
-
-
-def _turn_completed() -> bytes:
-    return (json.dumps({"type": "turn.completed", "usage": {}}) + "\n").encode()
+def _chat_result(thread_id: str, final_text: str) -> MagicMock:
+    result = MagicMock()
+    result.thread_id = thread_id
+    result.final_text = final_text
+    return result
 
 
 class TestCodexProcessStart:
     async def test_is_alive_after_start(self, tmp_path: Path) -> None:
         proc = CodexProcess(workspace=tmp_path)
         assert proc.is_alive is False
-        await proc.start()
+        with patch(
+            "bender.codex_process.CodexClient.connect_stdio",
+            return_value=_fake_client(),
+        ):
+            await proc.start()
         assert proc.is_alive is True
 
     async def test_close_marks_not_alive(self, tmp_path: Path) -> None:
         proc = CodexProcess(workspace=tmp_path)
-        await proc.start()
+        fake = _fake_client()
+        with patch("bender.codex_process.CodexClient.connect_stdio", return_value=fake):
+            await proc.start()
         await proc.close()
         assert proc.is_alive is False
+        fake.close.assert_awaited_once()
+
+    async def test_start_spawns_app_server_via_cmd_shim(self, tmp_path: Path) -> None:
+        """Windows resolves `codex` to an npm .cmd shim; the SDK's
+        stdio transport needs the explicit .cmd name."""
+        proc = CodexProcess(workspace=tmp_path)
+        with patch(
+            "bender.codex_process.CodexClient.connect_stdio",
+            return_value=_fake_client(),
+        ) as mock_connect:
+            await proc.start()
+
+        assert mock_connect.call_args.kwargs["command"] == [CODEX_EXECUTABLE, "app-server"]
 
 
 class TestCodexProcessSend:
@@ -52,161 +70,125 @@ class TestCodexProcessSend:
         with pytest.raises(CodexProcessError, match="not started"):
             await proc.send("hi")
 
-    async def test_first_send_uses_exec_without_resume(self, tmp_path: Path) -> None:
-        """A fresh thread (no session_id yet) runs `codex exec <prompt> --json`,
-        not `codex exec resume`."""
+    async def test_first_send_passes_no_thread_id(self, tmp_path: Path) -> None:
+        """A fresh thread (no session_id yet) omits thread_id so the
+        app-server starts a new one."""
         proc = CodexProcess(workspace=tmp_path)
-        await proc.start()
-        stdout = _thread_started("new-thread-id") + _agent_message("hello back") + _turn_completed()
-        fake = _fake_process(stdout)
+        fake = _fake_client()
+        fake.chat_once.return_value = _chat_result("new-thread-id", "hello back")
+        with patch("bender.codex_process.CodexClient.connect_stdio", return_value=fake):
+            await proc.start()
 
-        with patch(
-            "bender.codex_process.asyncio.create_subprocess_exec",
-            new_callable=AsyncMock,
-            return_value=fake,
-        ) as mock_exec:
-            result = await proc.send("hi")
+        result = await proc.send("hi")
 
         assert result == "hello back"
         assert proc.session_id == "new-thread-id"
-        args = mock_exec.call_args[0]
-        assert args[0] == CODEX_EXECUTABLE
-        assert "exec" in args
-        assert "resume" not in args
-        assert "hi" in args
+        assert fake.chat_once.call_args.kwargs["thread_id"] is None
+        assert fake.chat_once.call_args.args[0] == "hi"
+
+    async def test_second_send_reuses_client_and_resumes_thread(self, tmp_path: Path) -> None:
+        """Once a thread_id is known, the SAME app-server connection
+        (no re-spawn) is reused, passing the known thread_id."""
+        proc = CodexProcess(workspace=tmp_path, session_id="existing-thread")
+        fake = _fake_client()
+        fake.chat_once.return_value = _chat_result("existing-thread", "remembered")
+        with patch(
+            "bender.codex_process.CodexClient.connect_stdio", return_value=fake
+        ) as mock_connect:
+            await proc.start(resume=True)
+            await proc.send("what did I say?")
+            await proc.send("and again?")
+
+        assert mock_connect.call_count == 1
+        assert fake.chat_once.call_count == 2
+        for call in fake.chat_once.call_args_list:
+            assert call.kwargs["thread_id"] == "existing-thread"
 
     async def test_send_bypasses_approvals_for_mcp_tool_calls(self, tmp_path: Path) -> None:
-        """MCP tool calls (e.g. the `slack` server) fail closed under plain
-        --sandbox workspace-write ("approval policy is never"); only
-        --dangerously-bypass-approvals-and-sandbox lets them run, verified
-        against the real slack MCP server."""
+        """MCP tool calls (e.g. the `slack` server) fail closed under
+        any approval policy other than 'never'; only
+        approval_policy='never' + sandbox='danger-full-access' lets
+        them run, verified against the real slack MCP server."""
         proc = CodexProcess(workspace=tmp_path)
-        await proc.start()
-        stdout = _thread_started("t1") + _agent_message("ok") + _turn_completed()
-        fake = _fake_process(stdout)
-
-        with patch(
-            "bender.codex_process.asyncio.create_subprocess_exec",
-            new_callable=AsyncMock,
-            return_value=fake,
-        ) as mock_exec:
+        fake = _fake_client()
+        fake.chat_once.return_value = _chat_result("t1", "ok")
+        with patch("bender.codex_process.CodexClient.connect_stdio", return_value=fake):
+            await proc.start()
             await proc.send("hi")
 
-        args = mock_exec.call_args[0]
-        assert "--dangerously-bypass-approvals-and-sandbox" in args
-        assert "--sandbox" not in args
+        cfg = fake.chat_once.call_args.kwargs["thread_config"]
+        assert cfg.approval_policy == "never"
+        assert cfg.sandbox == "danger-full-access"
 
-    async def test_second_send_resumes_thread(self, tmp_path: Path) -> None:
-        """Once a thread_id is known, later turns use `codex exec resume --json <id>`."""
-        proc = CodexProcess(workspace=tmp_path, session_id="existing-thread")
-        await proc.start()
-        stdout = (
-            _thread_started("existing-thread") + _agent_message("remembered") + _turn_completed()
-        )
-        fake = _fake_process(stdout)
-
-        with patch(
-            "bender.codex_process.asyncio.create_subprocess_exec",
-            new_callable=AsyncMock,
-            return_value=fake,
-        ) as mock_exec:
-            result = await proc.send("what did I say?")
-
-        assert result == "remembered"
-        args = mock_exec.call_args[0]
-        assert "resume" in args
-        assert "--json" in args
-        assert "existing-thread" in args
-        assert "what did I say?" in args
-
-    async def test_skips_non_agent_message_items(self, tmp_path: Path) -> None:
-        """Only the agent_message item's text is returned; other event
-        types are ignored."""
+    async def test_raises_when_no_final_text(self, tmp_path: Path) -> None:
         proc = CodexProcess(workspace=tmp_path)
-        await proc.start()
-        stdout = (
-            _thread_started("t1")
-            + (json.dumps({"type": "turn.started"}) + "\n").encode()
-            + (
-                json.dumps({"type": "item.completed", "item": {"type": "command", "text": "ls"}})
-                + "\n"
-            ).encode()
-            + _agent_message("final answer")
-            + _turn_completed()
-        )
-        fake = _fake_process(stdout)
-
-        with patch(
-            "bender.codex_process.asyncio.create_subprocess_exec",
-            new_callable=AsyncMock,
-            return_value=fake,
-        ):
-            assert await proc.send("hi") == "final answer"
-
-    async def test_raises_on_nonzero_exit(self, tmp_path: Path) -> None:
-        proc = CodexProcess(workspace=tmp_path)
-        await proc.start()
-        fake = _fake_process(b"", stderr=b"auth error", returncode=1)
-
-        with patch(
-            "bender.codex_process.asyncio.create_subprocess_exec",
-            new_callable=AsyncMock,
-            return_value=fake,
-        ):
-            with pytest.raises(CodexProcessError, match="auth error"):
-                await proc.send("hi")
-
-    async def test_raises_when_no_agent_message_present(self, tmp_path: Path) -> None:
-        proc = CodexProcess(workspace=tmp_path)
-        await proc.start()
-        stdout = _thread_started("t1") + _turn_completed()
-        fake = _fake_process(stdout)
-
-        with patch(
-            "bender.codex_process.asyncio.create_subprocess_exec",
-            new_callable=AsyncMock,
-            return_value=fake,
-        ):
+        fake = _fake_client()
+        fake.chat_once.return_value = _chat_result("t1", "")
+        with patch("bender.codex_process.CodexClient.connect_stdio", return_value=fake):
+            await proc.start()
             with pytest.raises(CodexProcessError, match="no agent_message"):
                 await proc.send("hi")
 
-    async def test_timeout_kills_process(self, tmp_path: Path) -> None:
+    async def test_transport_error_raises_codex_process_error(self, tmp_path: Path) -> None:
         proc = CodexProcess(workspace=tmp_path)
-        await proc.start()
-        fake = MagicMock()
-        fake.communicate = AsyncMock(return_value=(b"", b""))
-        fake.kill = MagicMock()
-        fake.wait = AsyncMock(return_value=None)
+        fake = _fake_client()
+        fake.chat_once.side_effect = CodexTransportError("connection dropped")
+        with patch("bender.codex_process.CodexClient.connect_stdio", return_value=fake):
+            await proc.start()
+            with pytest.raises(CodexProcessError, match="connection dropped"):
+                await proc.send("hi")
 
-        with patch(
-            "bender.codex_process.asyncio.create_subprocess_exec",
-            new_callable=AsyncMock,
-            return_value=fake,
-        ), patch(
-            "bender.codex_process.asyncio.wait_for",
-            new_callable=AsyncMock,
-            side_effect=TimeoutError(),
-        ):
+    async def test_protocol_error_raises_codex_process_error(self, tmp_path: Path) -> None:
+        proc = CodexProcess(workspace=tmp_path)
+        fake = _fake_client()
+        fake.chat_once.side_effect = CodexProtocolError("bad params")
+        with patch("bender.codex_process.CodexClient.connect_stdio", return_value=fake):
+            await proc.start()
+            with pytest.raises(CodexProcessError, match="bad params"):
+                await proc.send("hi")
+
+    async def test_timeout_raises_codex_process_error(self, tmp_path: Path) -> None:
+        proc = CodexProcess(workspace=tmp_path)
+        fake = _fake_client()
+        fake.chat_once.side_effect = CodexTimeoutError("inactivity timeout")
+        with patch("bender.codex_process.CodexClient.connect_stdio", return_value=fake):
+            await proc.start()
             with pytest.raises(CodexProcessError, match="timed out"):
                 await proc.send("hi", timeout=1)
-
-        fake.kill.assert_called_once()
 
     async def test_uses_stripped_subprocess_env(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Bender's own Slack tokens must not leak into the codex subprocess either."""
+        """Bender's own Slack tokens must not leak into the codex
+        app-server subprocess either."""
         monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-benders-own-token")
         proc = CodexProcess(workspace=tmp_path)
-        await proc.start()
-        stdout = _thread_started("t1") + _agent_message("ok") + _turn_completed()
-        fake = _fake_process(stdout)
-
         with patch(
-            "bender.codex_process.asyncio.create_subprocess_exec",
-            new_callable=AsyncMock,
-            return_value=fake,
-        ) as mock_exec:
-            await proc.send("hi")
+            "bender.codex_process.CodexClient.connect_stdio",
+            return_value=_fake_client(),
+        ) as mock_connect:
+            await proc.start()
 
-        assert "SLACK_BOT_TOKEN" not in mock_exec.call_args.kwargs["env"]
+        assert "SLACK_BOT_TOKEN" not in mock_connect.call_args.kwargs["env"]
+
+    async def test_send_is_serialized_under_lock(self, tmp_path: Path) -> None:
+        """Two concurrent send() calls on the same thread must not
+        interleave chat_once calls on the shared connection."""
+        import asyncio
+
+        proc = CodexProcess(workspace=tmp_path)
+        fake = _fake_client()
+        call_order: list[str] = []
+
+        async def slow_chat_once(*args: object, **kwargs: object) -> MagicMock:
+            call_order.append("start")
+            await asyncio.sleep(0.01)
+            call_order.append("end")
+            return _chat_result("t1", "ok")
+
+        fake.chat_once.side_effect = slow_chat_once
+        with patch("bender.codex_process.CodexClient.connect_stdio", return_value=fake):
+            await proc.start()
+            await asyncio.gather(proc.send("a"), proc.send("b"))
+
+        assert call_order == ["start", "end", "start", "end"]

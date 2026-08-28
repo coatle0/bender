@@ -1,25 +1,27 @@
-"""Codex CLI subprocess wrapper.
+"""Long-lived Codex CLI subprocess.
 
-Codex has no stdin-streaming multi-turn primitive reachable from a plain
-subprocess the way Claude Code's `--input-format stream-json` does --
-that would require Codex's `app-server` daemon plus its `queue`/websocket
-protocol, which is not wired here. Each turn is instead a fresh
-`codex exec` (first turn) or `codex exec resume --json <thread_id>`
-(later turns) invocation, matching Claude Code's original one-shot
-design (bender's ClaudeProcess only became a long-lived process because
-Claude Code specifically supports it).
+Wraps `codex app-server`, a JSON-RPC daemon reached via the
+`codex-app-server-sdk` package, instead of spawning a fresh `codex exec`
+/ `codex exec resume` process per turn. The app-server subprocess is
+spawned once in start() and its MCP servers stay warm for every
+subsequent send() in the thread -- verified: first turn ~17.5s
+(includes MCP startup), second turn on the same connection ~6.9s.
+
+`codex-app-server-sdk` is AGPL-3.0 licensed (third-party, PyPI). This
+was flagged and accepted before adoption.
 
 On Windows, `codex` resolves to an npm `.cmd` shim rather than a native
-binary, and `asyncio.create_subprocess_exec(["codex", ...])` fails with
-FileNotFoundError because CreateProcess does not resolve PATHEXT the way
-a shell does. The executable name below is `codex.cmd` explicitly to
-avoid that.
+binary, and the SDK's stdio transport does not resolve PATHEXT the way
+a shell does, so the executable name below is `codex.cmd` explicitly,
+verified working.
 """
 
 import asyncio
-import json
 import logging
 from pathlib import Path
+
+from codex_app_server_sdk import CodexClient, ThreadConfig
+from codex_app_server_sdk.errors import CodexError, CodexTimeoutError
 
 from bender.claude_process import _subprocess_env
 from bender.errors import ProcessError
@@ -29,109 +31,85 @@ logger = logging.getLogger(__name__)
 DEFAULT_TURN_TIMEOUT_SECONDS = 300
 CODEX_EXECUTABLE = "codex.cmd"
 
+# Matches the bypassPermissions choice made for the Claude backend: MCP
+# tool calls (e.g. the `slack` server) fail closed under any approval
+# policy other than "never" -- verified against the real `slack` MCP
+# server, both in exec mode (--dangerously-bypass-approvals-and-sandbox)
+# and here.
+_THREAD_CONFIG = ThreadConfig(approval_policy="never", sandbox="danger-full-access")
+
 
 class CodexProcessError(ProcessError):
-    """Raised when a Codex CLI invocation fails or returns no reply."""
+    """Raised when the long-lived Codex app-server connection fails or
+    returns no reply."""
 
 
 class CodexProcess:
-    """One Codex CLI conversation thread.
-
-    Despite the name, this does not hold a long-lived OS process handle
-    (see module docstring) -- it holds the Codex `thread_id` and spawns
-    one `codex exec` invocation per `send()` call.
-    """
+    """One long-lived `codex app-server` connection bound to a single
+    Codex thread. Call `start()` once, then `send()` for each user turn."""
 
     def __init__(self, workspace: Path, session_id: str | None = None) -> None:
         self.workspace = workspace
         self.session_id = session_id
-        self._started = False
+        self._client: CodexClient | None = None
+        self._lock = asyncio.Lock()
 
     async def start(self, resume: bool = False) -> None:
-        """No process to spawn yet; send() does that per turn. Kept for
-        interface parity with ClaudeProcess / ProcessPool."""
-        self._started = True
+        """Spawn the app-server subprocess and complete the JSON-RPC
+        handshake. `resume` has no separate code path here -- an
+        existing session_id is simply passed as thread_id on the first
+        send() (see send()), same as `codex exec resume` did."""
+        logger.info(
+            "Starting long-lived Codex app-server (session=%s, resume=%s, workspace=%s)",
+            self.session_id,
+            resume,
+            self.workspace,
+        )
+        self._client = CodexClient.connect_stdio(
+            command=[CODEX_EXECUTABLE, "app-server"],
+            cwd=str(self.workspace),
+            env=_subprocess_env(),
+        )
+        await self._client.start()
+        await self._client.initialize()
 
     @property
     def is_alive(self) -> bool:
-        """Always true once started -- there is no OS process to go
-        stale, so ProcessPool keeps reusing this object (and its
-        session_id) for every message in the thread."""
-        return self._started
+        return self._client is not None
 
     async def send(self, prompt: str, timeout: int = DEFAULT_TURN_TIMEOUT_SECONDS) -> str:
-        if not self._started:
+        """Send one user turn and wait for the matching reply. Turns are
+        serialized: concurrent callers queue behind the lock so two
+        messages in the same thread never interleave on the connection."""
+        if self._client is None:
             raise CodexProcessError("process not started")
 
-        if self.session_id:
-            cmd = [
-                CODEX_EXECUTABLE, "exec", "resume", "--json", self.session_id, prompt,
-            ]
-        else:
-            cmd = [CODEX_EXECUTABLE, "exec", prompt, "--json"]
-        # Matches the bypassPermissions choice made for the Claude backend:
-        # MCP tool calls (e.g. the `slack` server) are subject to Codex's
-        # own approval policy independently of --sandbox, and fail closed
-        # ("approval policy is never") under workspace-write alone. Verified
-        # against the real `slack` MCP server -- only this flag lets an
-        # exec-mode call actually reach a tool.
-        cmd += ["--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check"]
-
-        logger.info(
-            "Running codex exec (session=%s, resume=%s, workspace=%s)",
-            self.session_id,
-            bool(self.session_id),
-            self.workspace,
-        )
-
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=self.workspace,
-            env=_subprocess_env(),
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-        except asyncio.TimeoutError as exc:
-            process.kill()
-            await process.wait()
-            raise CodexProcessError(f"Codex turn timed out after {timeout}s") from exc
-
-        if process.returncode != 0:
-            raise CodexProcessError(
-                f"codex exec exited {process.returncode}: "
-                f"{stderr.decode(errors='replace')[-500:]}"
+        async with self._lock:
+            logger.info(
+                "Sending codex app-server turn (thread_id=%s, workspace=%s)",
+                self.session_id,
+                self.workspace,
             )
-
-        return self._parse_jsonl(stdout.decode())
-
-    def _parse_jsonl(self, raw: str) -> str:
-        """Codex --json prints one JSON object per line: thread.started,
-        turn.started, item.completed (agent_message carries the reply
-        text), turn.completed. Grabs the thread_id and the last
-        agent_message text."""
-        text = ""
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line:
-                continue
             try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if data.get("type") == "thread.started" and data.get("thread_id"):
-                self.session_id = data["thread_id"]
-            elif data.get("type") == "item.completed":
-                item = data.get("item") or {}
-                if item.get("type") == "agent_message" and item.get("text"):
-                    text = item["text"]
-        if not text:
-            raise CodexProcessError("Codex produced no agent_message")
-        return text
+                result = await self._client.chat_once(
+                    prompt,
+                    thread_id=self.session_id,
+                    thread_config=_THREAD_CONFIG,
+                    inactivity_timeout=timeout,
+                )
+            except CodexTimeoutError as exc:
+                raise CodexProcessError(f"Codex turn timed out after {timeout}s") from exc
+            except CodexError as exc:
+                raise CodexProcessError(f"codex app-server turn failed: {exc}") from exc
+
+            self.session_id = result.thread_id
+            if not result.final_text:
+                raise CodexProcessError("Codex produced no agent_message")
+            return result.final_text
 
     async def close(self) -> None:
-        """No OS process is held between turns, so there is nothing to
-        terminate -- just mark the thread as no longer usable."""
-        self._started = False
+        """Close the app-server connection, terminating its subprocess."""
+        if self._client is None:
+            return
+        client, self._client = self._client, None
+        await client.close()

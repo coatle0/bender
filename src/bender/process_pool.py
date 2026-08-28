@@ -9,8 +9,8 @@ Bender restart would.
 
 `backend` selects which CLI a given ProcessPool (and therefore a given
 Bender instance) drives -- "claude" (ClaudeProcess, long-lived
-stream-json subprocess) or "codex" (CodexProcess, one-shot `codex exec`
-/ `codex exec resume` per turn). One Bender process only ever runs one
+stream-json subprocess) or "codex" (CodexProcess, long-lived `codex
+app-server` connection). One Bender process only ever runs one
 backend; running both means running two separate Bender instances
 (two Slack apps, two .env files, two ports).
 """
