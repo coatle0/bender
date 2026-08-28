@@ -5,15 +5,17 @@ import re
 
 from slack_bolt.async_app import AsyncApp
 
-from bender.claude_code import ClaudeCodeError, invoke_claude
-from bender.config import Settings
+from bender.claude_process import ClaudeProcessError
+from bender.process_pool import ProcessPool
 from bender.session_manager import SessionManager
 from bender.slack_utils import SLACK_MSG_LIMIT, md_to_mrkdwn, split_text
 
 logger = logging.getLogger(__name__)
 
 
-def register_handlers(app: AsyncApp, settings: Settings, sessions: SessionManager) -> None:
+def register_handlers(
+    app: AsyncApp, sessions: SessionManager, pool: ProcessPool
+) -> None:
     """Register Slack event handlers on the bolt app."""
 
     @app.event("reaction_added")
@@ -28,7 +30,8 @@ def register_handlers(app: AsyncApp, settings: Settings, sessions: SessionManage
 
     @app.event("app_mention")
     async def handle_mention(event: dict, say) -> None:
-        """Handle new @Bender mentions — create session and invoke Claude Code."""
+        """Handle new @Bender mentions — starts (or reuses) the thread's
+        long-lived Claude Code process."""
         text = _strip_mention(event.get("text", ""))
         thread_ts = event.get("ts", "")
         channel = event.get("channel", "")
@@ -39,22 +42,17 @@ def register_handlers(app: AsyncApp, settings: Settings, sessions: SessionManage
 
         logger.info("New mention in channel=%s thread=%s", channel, thread_ts)
 
-        session_id = await sessions.create_session(thread_ts)
-
         try:
-            response = await invoke_claude(
-                prompt=text,
-                workspace=settings.bender_workspace,
-                session_id=session_id,
-            )
-            await _post_response(say, response.result, thread_ts)
-        except ClaudeCodeError as exc:
+            result = await pool.send(thread_ts, text)
+            await _post_response(say, result, thread_ts)
+        except ClaudeProcessError as exc:
             logger.error("Claude Code invocation failed: %s", exc)
             await say(text=f"Sorry, something went wrong: {exc}", thread_ts=thread_ts)
 
     @app.event("message")
     async def handle_message(event: dict, say) -> None:
-        """Handle thread replies — resume existing session if one exists."""
+        """Handle thread replies — resume the thread's live process (or
+        start one, resuming its persisted session, if none is running)."""
         # Ignore bot messages to avoid loops
         if event.get("bot_id") or event.get("subtype"):
             return
@@ -64,8 +62,7 @@ def register_handlers(app: AsyncApp, settings: Settings, sessions: SessionManage
             # Not a thread reply, ignore
             return
 
-        session_id = await sessions.get_session(thread_ts)
-        if not session_id:
+        if not await sessions.has_session(thread_ts):
             # Thread not tracked by Bender, ignore
             return
 
@@ -77,14 +74,9 @@ def register_handlers(app: AsyncApp, settings: Settings, sessions: SessionManage
         logger.info("Thread reply in channel=%s thread=%s", channel, thread_ts)
 
         try:
-            response = await invoke_claude(
-                prompt=text,
-                workspace=settings.bender_workspace,
-                session_id=session_id,
-                resume=True,
-            )
-            await _post_response(say, response.result, thread_ts)
-        except ClaudeCodeError as exc:
+            result = await pool.send(thread_ts, text)
+            await _post_response(say, result, thread_ts)
+        except ClaudeProcessError as exc:
             logger.error("Claude Code invocation failed: %s", exc)
             await say(text=f"Sorry, something went wrong: {exc}", thread_ts=thread_ts)
 
