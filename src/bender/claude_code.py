@@ -6,6 +6,8 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+from bender.claude_process import _subprocess_env
+
 logger = logging.getLogger(__name__)
 
 # Default timeout for Claude Code invocations (5 minutes)
@@ -70,6 +72,7 @@ async def invoke_claude(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=workspace,
+            env=_subprocess_env(),
         )
 
         stdout, stderr = await asyncio.wait_for(

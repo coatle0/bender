@@ -10,11 +10,26 @@ thread instead of once per message.
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_TURN_TIMEOUT_SECONDS = 300
+
+# Bender's own Slack app credentials (its Bolt/Socket Mode connection) must
+# never leak into the Claude Code subprocess's environment: other MCP
+# servers (e.g. the project's `slack` tool) resolve SLACK_BOT_TOKEN too, and
+# would otherwise silently pick up Bender's narrow-scoped bot instead of the
+# intended one.
+_ENV_VARS_TO_STRIP = ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN")
+
+
+def _subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    for name in _ENV_VARS_TO_STRIP:
+        env.pop(name, None)
+    return env
 
 
 class ClaudeProcessError(Exception):
@@ -63,6 +78,7 @@ class ClaudeProcess:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self.workspace,
+            env=_subprocess_env(),
         )
 
     @property

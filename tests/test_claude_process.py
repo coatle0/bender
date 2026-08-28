@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from bender.claude_process import ClaudeProcess, ClaudeProcessError
+from bender.claude_process import ClaudeProcess, ClaudeProcessError, _subprocess_env
 
 
 def _fake_process(stdout_lines: list[bytes], stderr: bytes = b"") -> MagicMock:
@@ -41,6 +41,33 @@ def _result_line(text: str, session_id: str = "s1", is_error: bool = False) -> b
     return (json.dumps(payload) + "\n").encode()
 
 
+class TestSubprocessEnv:
+    """Bender's own Slack app tokens must never reach the Claude Code
+    subprocess — other MCP servers (e.g. the project's `slack` tool)
+    resolve SLACK_BOT_TOKEN too and would silently pick up the wrong bot."""
+
+    def test_strips_bender_slack_tokens(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-benders-own-token")
+        monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-benders-own-token")
+        monkeypatch.setenv("OPENACP_SLACK_BOT_TOKEN", "xoxb-production-token")
+
+        env = _subprocess_env()
+
+        assert "SLACK_BOT_TOKEN" not in env
+        assert "SLACK_APP_TOKEN" not in env
+        assert env["OPENACP_SLACK_BOT_TOKEN"] == "xoxb-production-token"
+
+    def test_preserves_other_env_vars(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-example")
+        env = _subprocess_env()
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-example"
+
+    def test_missing_tokens_do_not_raise(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+        monkeypatch.delenv("SLACK_APP_TOKEN", raising=False)
+        _subprocess_env()  # must not raise
+
+
 class TestClaudeProcessStart:
     async def test_start_builds_bypass_permissions_command(self, tmp_path: Path) -> None:
         """The spawned command always includes bypassPermissions and stream-json I/O."""
@@ -73,6 +100,22 @@ class TestClaudeProcessStart:
         args = mock_exec.call_args[0]
         assert "--resume" in args
         assert "existing-session" in args
+
+    async def test_start_passes_stripped_env_to_subprocess(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """start() actually wires _subprocess_env() into create_subprocess_exec."""
+        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-benders-own-token")
+        proc = ClaudeProcess(workspace=tmp_path)
+        fake = _fake_process([])
+        with patch(
+            "bender.claude_process.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+            return_value=fake,
+        ) as mock_exec:
+            await proc.start()
+
+        assert "SLACK_BOT_TOKEN" not in mock_exec.call_args.kwargs["env"]
 
     async def test_is_alive_reflects_process_state(self, tmp_path: Path) -> None:
         proc = ClaudeProcess(workspace=tmp_path)
