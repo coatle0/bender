@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     # Optional
     bender_workspace: Path = Path.cwd()
     bender_api_port: int = 8080
+    bender_db_path: Path = Path.cwd() / "bender_sessions.sqlite3"
     log_level: str = "info"
 
     # Optional: API key for authenticating external HTTP requests

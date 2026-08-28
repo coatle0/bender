@@ -18,6 +18,7 @@ def settings(tmp_path: Path) -> Settings:
         anthropic_api_key="sk-ant-test-key",
         bender_workspace=tmp_path,
         bender_api_port=9999,
+        bender_db_path=tmp_path / "sessions.sqlite3",
         log_level="debug",
     )
 

@@ -333,12 +333,10 @@ spec:
 
 ## Persistence
 
-### MVP: Minimal persistence
-
 | State | Where it lives | Notes |
 |-------|---------------|-------|
 | Claude Code sessions | `~/.claude/projects/` (local filesystem) | Survives process restarts. Lost if pod dies (acceptable for MVP). |
-| Thread → Session mapping | In-memory dictionary | Lost on restart. Threads after restart create new sessions. |
+| Thread → Session mapping | SQLite file at `BENDER_DB_PATH` (default: `bender_sessions.sqlite3` in `bender_workspace`) | Survives process restarts — a fresh `SessionManager` pointed at the same file recovers every thread→session mapping. Uses WAL mode. Defaults to an in-memory database (`:memory:`) when constructed with no `db_path`, which is what the test suite uses. |
 | Conversation history | Slack threads | Messages stay in Slack. No separate storage needed. |
 
 ---
@@ -451,11 +449,11 @@ All core features are implemented and tested:
 - [x] **Session management** — Thread ↔ Session mapping, `--resume` support
 - [x] **HTTP API** — FastAPI endpoint for external triggers with Bearer token auth
 - [x] **Docker images** — Base image + infrastructure variant (kubectl, vault, argocd)
-- [x] **Test suite** — 83 tests across all modules (pytest)
+- [x] **Test suite** — 96 tests across all modules (pytest)
 - [x] **Documentation** — README, CLAUDE.md, example workspace
 
 ### Future improvements
 
-- Persist thread → session mapping to SQLite or Redis for crash recovery
+- [x] Persist thread → session mapping to SQLite for crash recovery
 - Store session data on a PVC for pod persistence in Kubernetes
 - Python SDK integration (claude-agent-sdk) as alternative to CLI subprocess

@@ -1,22 +1,58 @@
-"""Session manager — maps Slack threads to Claude Code sessions."""
+"""Session manager — maps Slack threads to Claude Code sessions.
+
+Backed by SQLite so the thread -> session mapping survives process restarts
+(the underlying Claude Code sessions already persist to ~/.claude/projects/;
+this store just remembers which Slack thread goes with which session_id).
+"""
 
 import logging
+import sqlite3
 import uuid
 from asyncio import Lock
+from datetime import datetime, timezone
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+MEMORY_DB_PATH = ":memory:"
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
 
 class SessionManager:
-    """Thread-safe mapping between Slack thread timestamps and Claude Code session IDs.
+    """Thread-safe, SQLite-backed mapping between Slack thread timestamps
+    and Claude Code session IDs.
 
-    Each Slack thread maps to exactly one Claude Code session,
-    enabling multi-turn conversations with context preserved.
+    Each Slack thread maps to exactly one Claude Code session, enabling
+    multi-turn conversations with context preserved. The mapping is
+    persisted to disk by default, so a Bender restart does not orphan
+    in-flight threads.
     """
 
-    def __init__(self) -> None:
-        self._sessions: dict[str, str] = {}
+    def __init__(self, db_path: Path | str = MEMORY_DB_PATH) -> None:
+        self._db_path = str(db_path)
         self._lock = Lock()
+        # A single long-lived connection is safe here: asyncio runs
+        # coroutines on one OS thread, and self._lock already serializes
+        # every access to it.
+        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        if self._db_path != MEMORY_DB_PATH:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS thread_sessions (
+                thread_ts TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        self._conn.commit()
+        logger.info("SessionManager storing thread mappings at %s", self._db_path)
+
+    def close(self) -> None:
+        """Close the underlying SQLite connection."""
+        self._conn.close()
 
     async def create_session(self, thread_ts: str) -> str:
         """Create a new session for a Slack thread.
@@ -28,8 +64,7 @@ class SessionManager:
             The newly generated session ID.
         """
         session_id = str(uuid.uuid4())
-        async with self._lock:
-            self._sessions[thread_ts] = session_id
+        await self._upsert(thread_ts, session_id)
         logger.info("Created session %s for thread %s", session_id, thread_ts)
         return session_id
 
@@ -43,7 +78,11 @@ class SessionManager:
             The session ID, or None if no session exists for this thread.
         """
         async with self._lock:
-            return self._sessions.get(thread_ts)
+            row = self._conn.execute(
+                "SELECT session_id FROM thread_sessions WHERE thread_ts = ?",
+                (thread_ts,),
+            ).fetchone()
+        return row[0] if row else None
 
     async def has_session(self, thread_ts: str) -> bool:
         """Check whether a Slack thread has an existing session.
@@ -54,8 +93,7 @@ class SessionManager:
         Returns:
             True if the thread has an associated session.
         """
-        async with self._lock:
-            return thread_ts in self._sessions
+        return await self.get_session(thread_ts) is not None
 
     async def set_session(self, thread_ts: str, session_id: str) -> None:
         """Explicitly set the session ID for a thread (e.g., from API-created sessions).
@@ -64,6 +102,17 @@ class SessionManager:
             thread_ts: The Slack thread timestamp identifier.
             session_id: The Claude Code session ID to associate.
         """
-        async with self._lock:
-            self._sessions[thread_ts] = session_id
+        await self._upsert(thread_ts, session_id)
         logger.info("Set session %s for thread %s", session_id, thread_ts)
+
+    async def _upsert(self, thread_ts: str, session_id: str) -> None:
+        async with self._lock:
+            self._conn.execute(
+                """INSERT INTO thread_sessions (thread_ts, session_id, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(thread_ts) DO UPDATE SET
+                     session_id = excluded.session_id,
+                     updated_at = excluded.updated_at""",
+                (thread_ts, session_id, _utc_now_iso()),
+            )
+            self._conn.commit()

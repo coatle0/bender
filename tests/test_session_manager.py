@@ -1,6 +1,6 @@
 """Tests for the session manager module."""
 
-import pytest
+from pathlib import Path
 
 from bender.session_manager import SessionManager
 
@@ -80,3 +80,77 @@ class TestSessionManager:
         assert await session_manager.get_session(ts1) == id1
         assert await session_manager.get_session(ts2) == id2
         assert await session_manager.get_session(ts3) == id3
+
+
+class TestSessionManagerPersistence:
+    """Tests for SQLite-backed persistence across restarts."""
+
+    async def test_mapping_survives_new_instance_same_db_file(self, tmp_path: Path) -> None:
+        """A fresh SessionManager pointed at the same db file sees prior mappings."""
+        db_path = tmp_path / "sessions.sqlite3"
+        thread_ts = "1234567890.000001"
+
+        first = SessionManager(db_path=db_path)
+        session_id = await first.create_session(thread_ts)
+        first.close()
+
+        second = SessionManager(db_path=db_path)
+        try:
+            assert await second.get_session(thread_ts) == session_id
+            assert await second.has_session(thread_ts) is True
+        finally:
+            second.close()
+
+    async def test_set_session_survives_restart(self, tmp_path: Path) -> None:
+        """Explicit set_session mappings also survive a restart."""
+        db_path = tmp_path / "sessions.sqlite3"
+        thread_ts = "1234567890.000002"
+
+        first = SessionManager(db_path=db_path)
+        await first.set_session(thread_ts, "explicit-session-id")
+        first.close()
+
+        second = SessionManager(db_path=db_path)
+        try:
+            assert await second.get_session(thread_ts) == "explicit-session-id"
+        finally:
+            second.close()
+
+    async def test_db_file_created_on_disk(self, tmp_path: Path) -> None:
+        """A real db_path creates a file on disk, not just an in-memory table."""
+        db_path = tmp_path / "sessions.sqlite3"
+        manager = SessionManager(db_path=db_path)
+        try:
+            await manager.create_session("1234567890.000003")
+        finally:
+            manager.close()
+        assert db_path.exists()
+
+    async def test_default_memory_db_does_not_touch_disk(self, tmp_path: Path) -> None:
+        """The default (no db_path) constructor stays in-memory."""
+        manager = SessionManager()
+        try:
+            await manager.create_session("1234567890.000004")
+        finally:
+            manager.close()
+        # No file should appear in an otherwise-empty temp dir.
+        assert list(tmp_path.iterdir()) == []
+
+    async def test_restart_recovery_matches_bender_reliability_goal(
+        self, tmp_path: Path
+    ) -> None:
+        """End-to-end: create several threads, 'restart', verify all survive."""
+        db_path = tmp_path / "sessions.sqlite3"
+        threads = {f"restart-thread-{i}": None for i in range(5)}
+
+        first = SessionManager(db_path=db_path)
+        for thread_ts in threads:
+            threads[thread_ts] = await first.create_session(thread_ts)
+        first.close()
+
+        second = SessionManager(db_path=db_path)
+        try:
+            for thread_ts, expected_id in threads.items():
+                assert await second.get_session(thread_ts) == expected_id
+        finally:
+            second.close()

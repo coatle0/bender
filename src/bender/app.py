@@ -35,7 +35,7 @@ class BenderApp:
 
 def create_app(settings: Settings) -> BenderApp:
     """Create and configure the Bender application."""
-    sessions = SessionManager()
+    sessions = SessionManager(db_path=settings.bender_db_path)
 
     # Slack bolt app (Socket Mode)
     bolt_app = AsyncApp(token=settings.slack_bot_token)
