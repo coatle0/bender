@@ -38,6 +38,7 @@ class TestSettings:
         assert s.bender_workspace == Path.cwd()
         assert s.bender_api_port == 8080
         assert s.bender_db_path == Path.cwd() / "bender_sessions.sqlite3"
+        assert s.bender_backend == "claude"
         assert s.log_level == "info"
 
     def test_settings_auth_with_api_key(self) -> None:
@@ -106,6 +107,16 @@ class TestSettings:
 
         s = Settings()
         assert s.bender_db_path == custom_path
+
+    def test_settings_backend_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Settings loads BENDER_BACKEND from the environment."""
+        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+        monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-test")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        monkeypatch.setenv("BENDER_BACKEND", "codex")
+
+        s = Settings()
+        assert s.bender_backend == "codex"
 
 
 class TestConfigureLogging:

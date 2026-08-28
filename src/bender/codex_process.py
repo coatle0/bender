@@ -22,6 +22,7 @@ import logging
 from pathlib import Path
 
 from bender.claude_process import _subprocess_env
+from bender.errors import ProcessError
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +30,7 @@ DEFAULT_TURN_TIMEOUT_SECONDS = 300
 CODEX_EXECUTABLE = "codex.cmd"
 
 
-class CodexProcessError(Exception):
+class CodexProcessError(ProcessError):
     """Raised when a Codex CLI invocation fails or returns no reply."""
 
 

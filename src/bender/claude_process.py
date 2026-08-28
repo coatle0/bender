@@ -13,6 +13,8 @@ import logging
 import os
 from pathlib import Path
 
+from bender.errors import ProcessError
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_TURN_TIMEOUT_SECONDS = 300
@@ -32,7 +34,7 @@ def _subprocess_env() -> dict[str, str]:
     return env
 
 
-class ClaudeProcessError(Exception):
+class ClaudeProcessError(ProcessError):
     """Raised when the long-lived Claude Code process fails or errors out."""
 
 

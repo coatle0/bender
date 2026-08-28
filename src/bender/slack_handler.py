@@ -5,7 +5,7 @@ import re
 
 from slack_bolt.async_app import AsyncApp
 
-from bender.claude_process import ClaudeProcessError
+from bender.errors import ProcessError
 from bender.process_pool import ProcessPool
 from bender.session_manager import SessionManager
 from bender.slack_utils import SLACK_MSG_LIMIT, md_to_mrkdwn, split_text
@@ -45,8 +45,8 @@ def register_handlers(
         try:
             result = await pool.send(thread_ts, text)
             await _post_response(say, result, thread_ts)
-        except ClaudeProcessError as exc:
-            logger.error("Claude Code invocation failed: %s", exc)
+        except ProcessError as exc:
+            logger.error("Backend invocation failed: %s", exc)
             await say(text=f"Sorry, something went wrong: {exc}", thread_ts=thread_ts)
 
     @app.event("message")
@@ -76,8 +76,8 @@ def register_handlers(
         try:
             result = await pool.send(thread_ts, text)
             await _post_response(say, result, thread_ts)
-        except ClaudeProcessError as exc:
-            logger.error("Claude Code invocation failed: %s", exc)
+        except ProcessError as exc:
+            logger.error("Backend invocation failed: %s", exc)
             await say(text=f"Sorry, something went wrong: {exc}", thread_ts=thread_ts)
 
 

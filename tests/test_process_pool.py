@@ -10,6 +10,17 @@ from bender.process_pool import ProcessPool
 from bender.session_manager import SessionManager
 
 
+def _mock_codex_process(session_id: str = "new-codex-id") -> AsyncMock:
+    """A fake CodexProcess instance with canned start/send/close."""
+    instance = AsyncMock()
+    instance.is_alive = True
+    instance.session_id = session_id
+    instance.start = AsyncMock()
+    instance.send = AsyncMock(return_value="codex reply")
+    instance.close = AsyncMock()
+    return instance
+
+
 @pytest.fixture
 def sessions(tmp_path: Path) -> SessionManager:
     return SessionManager(db_path=tmp_path / "sessions.sqlite3")
@@ -102,6 +113,44 @@ class TestSend:
 
         assert pool._processes["thread-a"] is instance_a
         assert pool._processes["thread-b"] is instance_b
+
+
+class TestBackendSelection:
+    def test_rejects_unknown_backend(self, tmp_path: Path, sessions: SessionManager) -> None:
+        with pytest.raises(ValueError, match="backend"):
+            ProcessPool(workspace=tmp_path, sessions=sessions, backend="gpt5")
+
+    def test_defaults_to_claude_backend(self, tmp_path: Path, sessions: SessionManager) -> None:
+        pool = ProcessPool(workspace=tmp_path, sessions=sessions)
+        assert pool._backend == "claude"
+
+    async def test_claude_backend_constructs_claude_process(
+        self, tmp_path: Path, sessions: SessionManager
+    ) -> None:
+        pool = ProcessPool(workspace=tmp_path, sessions=sessions, backend="claude")
+        instance = _mock_claude_process()
+        with patch("bender.process_pool.ClaudeProcess", return_value=instance) as ctor, patch(
+            "bender.process_pool.CodexProcess"
+        ) as codex_ctor:
+            await pool.send("thread-1", "hi")
+
+        ctor.assert_called_once()
+        codex_ctor.assert_not_called()
+
+    async def test_codex_backend_constructs_codex_process(
+        self, tmp_path: Path, sessions: SessionManager
+    ) -> None:
+        pool = ProcessPool(workspace=tmp_path, sessions=sessions, backend="codex")
+        instance = _mock_codex_process()
+        with patch("bender.process_pool.CodexProcess", return_value=instance) as ctor, patch(
+            "bender.process_pool.ClaudeProcess"
+        ) as claude_ctor:
+            result = await pool.send("thread-1", "hi")
+
+        assert result == "codex reply"
+        ctor.assert_called_once_with(workspace=pool._workspace, session_id=None)
+        claude_ctor.assert_not_called()
+        assert await sessions.get_session("thread-1") == "new-codex-id"
 
 
 class TestReaper:
