@@ -69,7 +69,13 @@ class CodexProcess:
             ]
         else:
             cmd = [CODEX_EXECUTABLE, "exec", prompt, "--json"]
-        cmd += ["--sandbox", "workspace-write", "--skip-git-repo-check"]
+        # Matches the bypassPermissions choice made for the Claude backend:
+        # MCP tool calls (e.g. the `slack` server) are subject to Codex's
+        # own approval policy independently of --sandbox, and fail closed
+        # ("approval policy is never") under workspace-write alone. Verified
+        # against the real `slack` MCP server -- only this flag lets an
+        # exec-mode call actually reach a tool.
+        cmd += ["--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check"]
 
         logger.info(
             "Running codex exec (session=%s, resume=%s, workspace=%s)",

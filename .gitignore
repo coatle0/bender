@@ -29,7 +29,7 @@ build/
 
 # Environment variables
 .env
-.env.local
+.env.*
 
 # Runtime session store (BENDER_DB_PATH default)
 *.sqlite3

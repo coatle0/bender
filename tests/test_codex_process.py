@@ -75,6 +75,27 @@ class TestCodexProcessSend:
         assert "resume" not in args
         assert "hi" in args
 
+    async def test_send_bypasses_approvals_for_mcp_tool_calls(self, tmp_path: Path) -> None:
+        """MCP tool calls (e.g. the `slack` server) fail closed under plain
+        --sandbox workspace-write ("approval policy is never"); only
+        --dangerously-bypass-approvals-and-sandbox lets them run, verified
+        against the real slack MCP server."""
+        proc = CodexProcess(workspace=tmp_path)
+        await proc.start()
+        stdout = _thread_started("t1") + _agent_message("ok") + _turn_completed()
+        fake = _fake_process(stdout)
+
+        with patch(
+            "bender.codex_process.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+            return_value=fake,
+        ) as mock_exec:
+            await proc.send("hi")
+
+        args = mock_exec.call_args[0]
+        assert "--dangerously-bypass-approvals-and-sandbox" in args
+        assert "--sandbox" not in args
+
     async def test_second_send_resumes_thread(self, tmp_path: Path) -> None:
         """Once a thread_id is known, later turns use `codex exec resume --json <id>`."""
         proc = CodexProcess(workspace=tmp_path, session_id="existing-thread")
