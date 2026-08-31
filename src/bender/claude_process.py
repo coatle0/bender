@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+from collections import deque
 from pathlib import Path
 
 from bender.errors import ProcessError
@@ -18,6 +19,20 @@ from bender.errors import ProcessError
 logger = logging.getLogger(__name__)
 
 DEFAULT_TURN_TIMEOUT_SECONDS = 300
+
+# How many trailing stderr lines to keep for error reporting. Unbounded
+# retention isn't needed -- this only ever surfaces in the "process exited
+# unexpectedly" error message.
+_STDERR_TAIL_LINES = 50
+
+# asyncio.StreamReader.readline() defaults to a 64KiB limit and raises
+# ValueError if a single line exceeds it before hitting the separator.
+# stream-json emits one JSON object per line, and a single line embeds the
+# full content of any tool_use/tool_result in that turn -- an MCP call
+# that returns a large payload (seen in practice: an unfiltered financial
+# data dump north of 1MB) produces a stdout line well past the default,
+# which crashed turn parsing outright rather than merely being slow.
+_STDOUT_LINE_LIMIT = 16 * 1024 * 1024
 
 # Bender's own Slack app credentials (its Bolt/Socket Mode connection) must
 # never leak into the Claude Code subprocess's environment: other MCP
@@ -47,6 +62,8 @@ class ClaudeProcess:
         self.session_id = session_id
         self._process: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
+        self._stderr_tail: deque[bytes] = deque(maxlen=_STDERR_TAIL_LINES)
+        self._stderr_task: asyncio.Task[None] | None = None
 
     async def start(self, resume: bool = False) -> None:
         """Spawn the subprocess. If resume=True and session_id is set,
@@ -81,7 +98,9 @@ class ClaudeProcess:
             stderr=asyncio.subprocess.PIPE,
             cwd=self.workspace,
             env=_subprocess_env(),
+            limit=_STDOUT_LINE_LIMIT,
         )
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
 
     @property
     def is_alive(self) -> bool:
@@ -104,14 +123,44 @@ class ClaudeProcess:
             except asyncio.TimeoutError as exc:
                 raise ClaudeProcessError(f"Claude Code turn timed out after {timeout}s") from exc
 
+    async def _drain_stderr(self) -> None:
+        """Continuously read stderr into a bounded tail buffer.
+
+        `--verbose` mode can write enough diagnostic output mid-turn to
+        fill the OS pipe buffer; if nothing drains stderr, the `claude`
+        subprocess blocks on that write and never reaches the point of
+        emitting its stdout `result` line -- the turn then hangs until
+        the caller's timeout fires. Reading stderr lazily (only at
+        stdout EOF, the previous approach) doesn't prevent this because
+        the deadlock happens *before* EOF. Draining continuously in the
+        background avoids it; only the tail is kept, for error messages.
+        """
+        assert self._process is not None and self._process.stderr is not None
+        try:
+            while True:
+                line = await self._process.stderr.readline()
+                if not line:
+                    return
+                self._stderr_tail.append(line)
+        except (asyncio.CancelledError, ValueError):
+            pass
+
     async def _read_until_result(self) -> str:
         assert self._process is not None and self._process.stdout is not None
         while True:
             line = await self._process.stdout.readline()
             if not line:
-                stderr = b""
-                if self._process.stderr is not None:
-                    stderr = await self._process.stderr.read()
+                # The process exited (or closed stdout). Give the stderr
+                # drain task a brief moment to flush its final lines --
+                # stdout EOF and the last stderr writes can arrive in
+                # either order, and an empty error message here would
+                # hide the actual crash reason.
+                if self._stderr_task is not None:
+                    try:
+                        await asyncio.wait_for(asyncio.shield(self._stderr_task), timeout=1)
+                    except (TimeoutError, asyncio.TimeoutError):
+                        pass
+                stderr = b"".join(self._stderr_tail)
                 raise ClaudeProcessError(
                     "Claude Code process ended unexpectedly: "
                     f"{stderr.decode(errors='replace')[-500:]}"
@@ -139,4 +188,7 @@ class ClaudeProcess:
         except (asyncio.TimeoutError, ProcessLookupError):
             self._process.kill()
             await self._process.wait()
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
+            self._stderr_task = None
         self._process = None

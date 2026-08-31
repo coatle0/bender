@@ -9,7 +9,7 @@ import pytest
 from bender.claude_process import ClaudeProcess, ClaudeProcessError, _subprocess_env
 
 
-def _fake_process(stdout_lines: list[bytes], stderr: bytes = b"") -> MagicMock:
+def _fake_process(stdout_lines: list[bytes], stderr_lines: list[bytes] | None = None) -> MagicMock:
     """Build a MagicMock standing in for asyncio.subprocess.Process."""
     proc = MagicMock()
     proc.returncode = None
@@ -28,8 +28,17 @@ def _fake_process(stdout_lines: list[bytes], stderr: bytes = b"") -> MagicMock:
     proc.stdout = MagicMock()
     proc.stdout.readline = AsyncMock(side_effect=readline)
 
+    # _drain_stderr() consumes this the same way _read_until_result()
+    # consumes stdout: readline() in a loop until b"".
+    remaining_stderr = list(stderr_lines or [])
+
+    async def readline_stderr():
+        if remaining_stderr:
+            return remaining_stderr.pop(0)
+        return b""
+
     proc.stderr = MagicMock()
-    proc.stderr.read = AsyncMock(return_value=stderr)
+    proc.stderr.readline = AsyncMock(side_effect=readline_stderr)
 
     proc.wait = AsyncMock(return_value=0)
     proc.kill = MagicMock()
@@ -202,7 +211,7 @@ class TestClaudeProcessSend:
     async def test_send_raises_when_process_exits_without_result(self, tmp_path: Path) -> None:
         """EOF before a result message raises ClaudeProcessError with stderr."""
         proc = ClaudeProcess(workspace=tmp_path)
-        fake = _fake_process([], stderr=b"segfault")
+        fake = _fake_process([], stderr_lines=[b"segfault"])
         with patch(
             "bender.claude_process.asyncio.create_subprocess_exec",
             new_callable=AsyncMock,
