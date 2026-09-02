@@ -95,6 +95,35 @@ class TestHandleMention:
         pool.send.assert_not_called()
         mock_say.assert_called_once_with(text="How can I help?", thread_ts="1234567890.000001")
 
+    async def test_mention_appends_session_id_footer(
+        self,
+        setup_handler,
+        session_manager: SessionManager,
+        pool: AsyncMock,
+        mock_say: AsyncMock,
+    ) -> None:
+        """The first-turn reply is tagged with the session id ProcessPool
+        just persisted, so a stuck thread can be grepped out of the logs
+        by that id instead of reconstructed from Slack timestamps."""
+        handler = setup_handler["app_mention"]
+        event = {
+            "text": "<@U12345> check the logs",
+            "ts": "1234567890.000001",
+            "channel": "C123",
+        }
+        pool.send.return_value = "Logs look fine"
+        # Stand in for what the real ProcessPool.send() does internally
+        # (persist proc.session_id via SessionManager) before the handler
+        # reads it back.
+        await session_manager.set_session("1234567890.000001", "sess-abc-123")
+
+        await handler(event=event, say=mock_say)
+
+        mock_say.assert_called_once_with(
+            text="Logs look fine\n\n_(session: `sess-abc-123`)_",
+            thread_ts="1234567890.000001",
+        )
+
     async def test_mention_claude_error_posts_error(
         self, setup_handler, pool: AsyncMock, mock_say: AsyncMock
     ) -> None:

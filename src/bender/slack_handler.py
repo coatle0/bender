@@ -44,6 +44,14 @@ def register_handlers(
 
         try:
             result = await pool.send(thread_ts, text)
+            session_id = await sessions.get_session(thread_ts)
+            if session_id:
+                # Surfaced only on the thread's first reply, once per thread
+                # rather than on every turn -- lets a stuck/misbehaving
+                # thread be grepped straight out of the logs by session_id
+                # instead of reconstructed from Slack timestamps after the
+                # fact (the exact gap hit debugging a hung Codexy turn).
+                result = f"{result}\n\n_(session: `{session_id}`)_"
             await _post_response(say, result, thread_ts)
         except ProcessError as exc:
             logger.error("Backend invocation failed: %s", exc)
