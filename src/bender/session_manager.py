@@ -105,6 +105,30 @@ class SessionManager:
         await self._upsert(thread_ts, session_id)
         logger.info("Set session %s for thread %s", session_id, thread_ts)
 
+    async def clear_session(self, thread_ts: str) -> None:
+        """Drop a thread's persisted session mapping.
+
+        For when the persisted session_id itself is the problem: a backend
+        can fail to resume a session (transport error, corrupted resume
+        state, etc.) in a way that will keep failing identically forever,
+        since ProcessPool evicting the in-memory process still leaves this
+        same broken session_id on disk for the *next* message to resume
+        into. Observed live: a thread's session_id became permanently
+        unresumable after its app-server connection dropped mid-turn, and
+        every retry failed in under a second with the same transport
+        error. Clearing this mapping is what lets the next message start
+        a fresh session instead of repeating that failure indefinitely.
+
+        Args:
+            thread_ts: The Slack thread timestamp identifier.
+        """
+        async with self._lock:
+            self._conn.execute(
+                "DELETE FROM thread_sessions WHERE thread_ts = ?", (thread_ts,)
+            )
+            self._conn.commit()
+        logger.info("Cleared session mapping for thread %s", thread_ts)
+
     async def _upsert(self, thread_ts: str, session_id: str) -> None:
         async with self._lock:
             self._conn.execute(

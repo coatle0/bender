@@ -65,6 +65,27 @@ class TestSessionManager:
         result = await session_manager.get_session(thread_ts)
         assert result == new_id
 
+    async def test_clear_session_removes_mapping(
+        self, session_manager: SessionManager
+    ) -> None:
+        """clear_session drops a thread's mapping so it reads back as
+        unset -- for a persisted session_id that's become permanently
+        unresumable, this is what lets the thread's next message start
+        fresh instead of retrying the same broken resume forever."""
+        thread_ts = "1234567890.000001"
+        await session_manager.set_session(thread_ts, "now-broken-session-id")
+
+        await session_manager.clear_session(thread_ts)
+
+        assert await session_manager.get_session(thread_ts) is None
+        assert await session_manager.has_session(thread_ts) is False
+
+    async def test_clear_session_nonexistent_thread_is_noop(
+        self, session_manager: SessionManager
+    ) -> None:
+        """Clearing a thread with no mapping must not raise."""
+        await session_manager.clear_session("9999999999.999999")  # must not raise
+
     async def test_multiple_threads_independent(
         self, session_manager: SessionManager
     ) -> None:

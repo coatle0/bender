@@ -111,6 +111,41 @@ class TestSend:
 
         assert ctor.call_count == 2
 
+    async def test_resumed_process_failure_clears_persisted_session(
+        self, pool: ProcessPool, sessions: SessionManager
+    ) -> None:
+        """A resumed process that fails to actually resume (broken
+        transport, corrupted state, etc.) must not leave that same
+        session_id persisted -- otherwise every future message on this
+        thread retries the identical resume and fails identically,
+        forever. Observed live: an app-server connection dropped
+        mid-turn, and the persisted session became permanently
+        unresumable, failing every retry in under a second."""
+        await sessions.set_session("thread-4", "old-session-id")
+        instance = _mock_claude_process(session_id="old-session-id")
+        instance.send.side_effect = ClaudeProcessError("failed reading from stdio transport")
+
+        with patch("bender.process_pool.ClaudeProcess", return_value=instance):
+            with pytest.raises(ClaudeProcessError):
+                await pool.send("thread-4", "hello")
+
+        assert await sessions.get_session("thread-4") is None
+
+    async def test_fresh_process_failure_leaves_nothing_to_clear(
+        self, pool: ProcessPool, sessions: SessionManager
+    ) -> None:
+        """A brand-new thread's first turn failing has no persisted
+        session yet (session_id is only assigned by a successful turn) --
+        clearing must be a harmless no-op, not an error."""
+        instance = _mock_claude_process(session_id=None)
+        instance.send.side_effect = ClaudeProcessError("boom")
+
+        with patch("bender.process_pool.ClaudeProcess", return_value=instance):
+            with pytest.raises(ClaudeProcessError):
+                await pool.send("thread-5", "hello")
+
+        assert await sessions.get_session("thread-5") is None
+
     async def test_independent_threads_get_independent_processes(
         self, pool: ProcessPool
     ) -> None:

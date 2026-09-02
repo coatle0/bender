@@ -93,18 +93,32 @@ class ProcessPool:
         """Route one Slack message to the thread's live process, starting
         one (fresh or resumed) if none is currently running."""
         proc = await self._get_or_start(thread_ts)
+        # Known before send() only for a resumed process -- a fresh one's
+        # session_id is None until a successful turn assigns it. Needed
+        # below to tell "this resume attempt is what just failed" apart
+        # from "this thread never had a persisted session to begin with".
+        was_resumed = proc.session_id is not None
         try:
             result = await proc.send(prompt)
         except ProcessError as exc:
             # The live process died mid-turn. Drop it so the next message
-            # starts a fresh process that resumes from the last-persisted
-            # session_id instead of reusing the dead handle.
+            # starts a fresh process instead of reusing the dead handle.
             logger.warning(
                 "Evicting process for thread %s after error: %s", thread_ts, exc
             )
             async with self._lock:
                 self._processes.pop(thread_ts, None)
                 self._last_used.pop(thread_ts, None)
+            if was_resumed:
+                # Dropping the in-memory process alone isn't enough here:
+                # the persisted session_id it was resuming is still on
+                # disk, so the *next* message would try to resume that
+                # exact same session and hit the exact same failure --
+                # observed live as a session whose app-server connection
+                # dropped mid-turn becoming permanently unresumable,
+                # failing every retry in under a second. Clearing the
+                # mapping lets the next message start fresh instead.
+                await self._sessions.clear_session(thread_ts)
             raise
         if proc.session_id:
             await self._sessions.set_session(thread_ts, proc.session_id)
