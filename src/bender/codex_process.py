@@ -18,6 +18,7 @@ verified working.
 
 import asyncio
 import logging
+import time
 from pathlib import Path
 
 from codex_app_server_sdk import CodexClient, ThreadConfig
@@ -48,9 +49,18 @@ class CodexProcess:
     """One long-lived `codex app-server` connection bound to a single
     Codex thread. Call `start()` once, then `send()` for each user turn."""
 
-    def __init__(self, workspace: Path, session_id: str | None = None) -> None:
+    def __init__(
+        self, workspace: Path, session_id: str | None = None, thread_ts: str | None = None
+    ) -> None:
         self.workspace = workspace
         self.session_id = session_id
+        # Slack thread timestamp -- included in every log line below so a
+        # specific thread's whole lifecycle can be grepped out of the log
+        # by one stable id. self.session_id (the Codex thread_id) doesn't
+        # work for this: it's None until the first turn's result assigns
+        # one, so a turn that never completes has nothing to grep by
+        # unless thread_ts is threaded through separately.
+        self.thread_ts = thread_ts
         self._client: CodexClient | None = None
         self._lock = asyncio.Lock()
 
@@ -60,7 +70,8 @@ class CodexProcess:
         existing session_id is simply passed as thread_id on the first
         send() (see send()), same as `codex exec resume` did."""
         logger.info(
-            "Starting long-lived Codex app-server (session=%s, resume=%s, workspace=%s)",
+            "Starting long-lived Codex app-server (thread=%s, session=%s, resume=%s, workspace=%s)",
+            self.thread_ts,
             self.session_id,
             resume,
             self.workspace,
@@ -86,10 +97,12 @@ class CodexProcess:
 
         async with self._lock:
             logger.info(
-                "Sending codex app-server turn (thread_id=%s, workspace=%s)",
+                "Sending codex app-server turn (thread=%s, session=%s, workspace=%s)",
+                self.thread_ts,
                 self.session_id,
                 self.workspace,
             )
+            start = time.monotonic()
             try:
                 # The SDK's own inactivity_timeout is a sliding window: it
                 # resets on every turn event, not just the final one. A
@@ -109,11 +122,23 @@ class CodexProcess:
                 )
             except asyncio.TimeoutError as exc:
                 await self._force_close_after_timeout()
+                logger.warning(
+                    "Codex turn timed out after %.1fs hard cap (thread=%s, session=%s)",
+                    time.monotonic() - start,
+                    self.thread_ts,
+                    self.session_id,
+                )
                 raise CodexProcessError(
                     f"Codex turn timed out after {timeout}s (hard cap)"
                 ) from exc
             except CodexTimeoutError as exc:
                 await self._force_close_after_timeout()
+                logger.warning(
+                    "Codex turn timed out after %.1fs (thread=%s, session=%s)",
+                    time.monotonic() - start,
+                    self.thread_ts,
+                    self.session_id,
+                )
                 raise CodexProcessError(f"Codex turn timed out after {timeout}s") from exc
             except CodexError as exc:
                 raise CodexProcessError(f"codex app-server turn failed: {exc}") from exc
@@ -121,6 +146,12 @@ class CodexProcess:
             self.session_id = result.thread_id
             if not result.final_text:
                 raise CodexProcessError("Codex produced no agent_message")
+            logger.info(
+                "Codex turn completed in %.1fs (thread=%s, session=%s)",
+                time.monotonic() - start,
+                self.thread_ts,
+                self.session_id,
+            )
             return result.final_text
 
     async def _force_close_after_timeout(self) -> None:

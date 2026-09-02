@@ -52,7 +52,7 @@ class TestSend:
             result = await pool.send("thread-1", "hello")
 
         assert result == "reply"
-        ctor.assert_called_once_with(workspace=pool._workspace, session_id=None)
+        ctor.assert_called_once_with(workspace=pool._workspace, session_id=None, thread_ts="thread-1")
         instance.start.assert_called_once_with(resume=False)
         assert await sessions.get_session("thread-1") == "fresh-id"
 
@@ -78,19 +78,31 @@ class TestSend:
         with patch("bender.process_pool.ClaudeProcess", return_value=instance) as ctor:
             await pool.send("thread-2", "continue please")
 
-        ctor.assert_called_once_with(workspace=pool._workspace, session_id="old-session-id")
+        ctor.assert_called_once_with(
+            workspace=pool._workspace, session_id="old-session-id", thread_ts="thread-2"
+        )
         instance.start.assert_called_once_with(resume=True)
 
-    async def test_dead_process_error_drops_it_from_pool(self, pool: ProcessPool) -> None:
+    async def test_dead_process_error_drops_it_from_pool(
+        self, pool: ProcessPool, caplog: pytest.LogCaptureFixture
+    ) -> None:
         """A ClaudeProcessError during send() removes the process from the pool
-        so the next call starts a fresh one instead of reusing a dead handle."""
+        so the next call starts a fresh one instead of reusing a dead handle,
+        and logs the eviction (by thread_ts, the same correlation id used
+        elsewhere) so it's visible without inferring it from the absence of
+        a completion line."""
         instance = _mock_claude_process()
         instance.send.side_effect = ClaudeProcessError("crashed")
 
-        with patch("bender.process_pool.ClaudeProcess", return_value=instance) as ctor:
+        with caplog.at_level("WARNING"), patch(
+            "bender.process_pool.ClaudeProcess", return_value=instance
+        ) as ctor:
             with pytest.raises(ClaudeProcessError):
                 await pool.send("thread-3", "hello")
             assert "thread-3" not in pool._processes
+            assert any(
+                "Evicting process for thread thread-3" in r.message for r in caplog.records
+            )
 
             # next call spawns a new process rather than reusing the dead one
             instance2 = _mock_claude_process()
@@ -148,7 +160,7 @@ class TestBackendSelection:
             result = await pool.send("thread-1", "hi")
 
         assert result == "codex reply"
-        ctor.assert_called_once_with(workspace=pool._workspace, session_id=None)
+        ctor.assert_called_once_with(workspace=pool._workspace, session_id=None, thread_ts="thread-1")
         claude_ctor.assert_not_called()
         assert await sessions.get_session("thread-1") == "new-codex-id"
 

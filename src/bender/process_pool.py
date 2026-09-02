@@ -95,10 +95,13 @@ class ProcessPool:
         proc = await self._get_or_start(thread_ts)
         try:
             result = await proc.send(prompt)
-        except ProcessError:
+        except ProcessError as exc:
             # The live process died mid-turn. Drop it so the next message
             # starts a fresh process that resumes from the last-persisted
             # session_id instead of reusing the dead handle.
+            logger.warning(
+                "Evicting process for thread %s after error: %s", thread_ts, exc
+            )
             async with self._lock:
                 self._processes.pop(thread_ts, None)
                 self._last_used.pop(thread_ts, None)
@@ -119,10 +122,12 @@ class ProcessPool:
         existing_session_id = await self._sessions.get_session(thread_ts)
         if self._backend == "codex":
             proc: ThreadBackend = CodexProcess(
-                workspace=self._workspace, session_id=existing_session_id
+                workspace=self._workspace, session_id=existing_session_id, thread_ts=thread_ts
             )
         else:
-            proc = ClaudeProcess(workspace=self._workspace, session_id=existing_session_id)
+            proc = ClaudeProcess(
+                workspace=self._workspace, session_id=existing_session_id, thread_ts=thread_ts
+            )
         await proc.start(resume=existing_session_id is not None)
 
         async with self._lock:

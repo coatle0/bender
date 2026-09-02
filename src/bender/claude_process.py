@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections import deque
 from pathlib import Path
 
@@ -57,9 +58,19 @@ class ClaudeProcess:
     """One long-lived `claude` subprocess bound to a single Claude Code
     session. Call `start()` once, then `send()` for each user turn."""
 
-    def __init__(self, workspace: Path, session_id: str | None = None) -> None:
+    def __init__(
+        self, workspace: Path, session_id: str | None = None, thread_ts: str | None = None
+    ) -> None:
         self.workspace = workspace
         self.session_id = session_id
+        # Slack thread timestamp -- included in every log line below so a
+        # specific thread's whole lifecycle (start, each turn, completion
+        # or failure) can be grepped out of the log by one stable id.
+        # session_id doesn't work for this: it's None until Claude Code
+        # assigns one on the *first* turn's result, so anything logged
+        # before that (or a turn that never completes) has nothing to
+        # grep by unless thread_ts is threaded through separately.
+        self.thread_ts = thread_ts
         self._process: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
         self._stderr_tail: deque[bytes] = deque(maxlen=_STDERR_TAIL_LINES)
@@ -86,7 +97,8 @@ class ClaudeProcess:
             cmd.extend(["--session-id", self.session_id])
 
         logger.info(
-            "Starting long-lived Claude process (session=%s, resume=%s, workspace=%s)",
+            "Starting long-lived Claude process (thread=%s, session=%s, resume=%s, workspace=%s)",
+            self.thread_ts,
             self.session_id,
             resume,
             self.workspace,
@@ -114,14 +126,32 @@ class ClaudeProcess:
             raise ClaudeProcessError("process not started")
 
         async with self._lock:
+            logger.info(
+                "Sending Claude Code turn (thread=%s, session=%s)", self.thread_ts, self.session_id
+            )
+            start = time.monotonic()
             payload = json.dumps({"type": "user", "message": {"role": "user", "content": prompt}})
             self._process.stdin.write((payload + "\n").encode())
             await self._process.stdin.drain()
 
             try:
-                return await asyncio.wait_for(self._read_until_result(), timeout=timeout)
+                result = await asyncio.wait_for(self._read_until_result(), timeout=timeout)
             except asyncio.TimeoutError as exc:
+                logger.warning(
+                    "Claude Code turn timed out after %.1fs (thread=%s, session=%s)",
+                    time.monotonic() - start,
+                    self.thread_ts,
+                    self.session_id,
+                )
                 raise ClaudeProcessError(f"Claude Code turn timed out after {timeout}s") from exc
+
+            logger.info(
+                "Claude Code turn completed in %.1fs (thread=%s, session=%s)",
+                time.monotonic() - start,
+                self.thread_ts,
+                self.session_id,
+            )
+            return result
 
     async def _drain_stderr(self) -> None:
         """Continuously read stderr into a bounded tail buffer.

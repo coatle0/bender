@@ -54,7 +54,7 @@ def register_handlers(
                 result = f"{result}\n\n_(session: `{session_id}`)_"
             await _post_response(say, result, thread_ts)
         except ProcessError as exc:
-            logger.error("Backend invocation failed: %s", exc)
+            logger.error("Backend invocation failed (thread=%s): %s", thread_ts, exc)
             await say(text=f"Sorry, something went wrong: {exc}", thread_ts=thread_ts)
 
     @app.event("message")
@@ -85,7 +85,7 @@ def register_handlers(
             result = await pool.send(thread_ts, text)
             await _post_response(say, result, thread_ts)
         except ProcessError as exc:
-            logger.error("Backend invocation failed: %s", exc)
+            logger.error("Backend invocation failed (thread=%s): %s", thread_ts, exc)
             await say(text=f"Sorry, something went wrong: {exc}", thread_ts=thread_ts)
 
 
