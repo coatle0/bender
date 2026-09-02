@@ -130,13 +130,21 @@ class TestCodexProcessSend:
                 await proc.send("hi")
 
     async def test_transport_error_raises_codex_process_error(self, tmp_path: Path) -> None:
+        """A non-timeout CodexError (e.g. the connection itself failing)
+        must still close the client and mark the process dead -- observed
+        live as an orphaned codex.cmd/node/codex.exe child chain still
+        running minutes after "failed reading from stdio transport" had
+        already evicted the CodexProcess object from the pool."""
         proc = CodexProcess(workspace=tmp_path)
         fake = _fake_client()
-        fake.chat_once.side_effect = CodexTransportError("connection dropped")
+        fake.chat_once.side_effect = CodexTransportError("failed reading from stdio transport")
         with patch("bender.codex_process.CodexClient.connect_stdio", return_value=fake):
             await proc.start()
-            with pytest.raises(CodexProcessError, match="connection dropped"):
+            with pytest.raises(CodexProcessError, match="failed reading from stdio transport"):
                 await proc.send("hi")
+
+        fake.close.assert_awaited_once()
+        assert proc.is_alive is False
 
     async def test_protocol_error_raises_codex_process_error(self, tmp_path: Path) -> None:
         proc = CodexProcess(workspace=tmp_path)
@@ -146,6 +154,9 @@ class TestCodexProcessSend:
             await proc.start()
             with pytest.raises(CodexProcessError, match="bad params"):
                 await proc.send("hi")
+
+        fake.close.assert_awaited_once()
+        assert proc.is_alive is False
 
     async def test_timeout_raises_codex_process_error(self, tmp_path: Path) -> None:
         proc = CodexProcess(workspace=tmp_path)

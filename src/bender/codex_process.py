@@ -121,7 +121,7 @@ class CodexProcess:
                     timeout=timeout,
                 )
             except asyncio.TimeoutError as exc:
-                await self._force_close_after_timeout()
+                await self._force_close_after_error()
                 logger.warning(
                     "Codex turn timed out after %.1fs hard cap (thread=%s, session=%s)",
                     time.monotonic() - start,
@@ -132,7 +132,7 @@ class CodexProcess:
                     f"Codex turn timed out after {timeout}s (hard cap)"
                 ) from exc
             except CodexTimeoutError as exc:
-                await self._force_close_after_timeout()
+                await self._force_close_after_error()
                 logger.warning(
                     "Codex turn timed out after %.1fs (thread=%s, session=%s)",
                     time.monotonic() - start,
@@ -141,6 +141,22 @@ class CodexProcess:
                 )
                 raise CodexProcessError(f"Codex turn timed out after {timeout}s") from exc
             except CodexError as exc:
+                # Not just a timeout -- e.g. "failed reading from stdio
+                # transport" (the app-server subprocess died or the pipe
+                # broke mid-turn), seen live. Any of these leave _client
+                # unusable, so clean it up here too: confirmed live that
+                # without this, ProcessPool evicts the CodexProcess object
+                # but the codex.cmd/node/codex.exe child chain it owned
+                # keeps running as an orphan (found still alive minutes
+                # after the error, doing nothing).
+                await self._force_close_after_error()
+                logger.warning(
+                    "Codex turn failed after %.1fs (thread=%s, session=%s): %s",
+                    time.monotonic() - start,
+                    self.thread_ts,
+                    self.session_id,
+                    exc,
+                )
                 raise CodexProcessError(f"codex app-server turn failed: {exc}") from exc
 
             self.session_id = result.thread_id
@@ -154,8 +170,9 @@ class CodexProcess:
             )
             return result.final_text
 
-    async def _force_close_after_timeout(self) -> None:
-        """Tear down a wedged connection after a hard timeout.
+    async def _force_close_after_error(self) -> None:
+        """Tear down a connection that just failed a turn (timeout or any
+        other CodexError).
 
         CodexProcessError is a ProcessError, which ProcessPool.send()
         catches by evicting this instance so the thread's next message
