@@ -155,6 +155,34 @@ class TestCodexProcessSend:
             await proc.start()
             with pytest.raises(CodexProcessError, match="timed out"):
                 await proc.send("hi", timeout=1)
+        fake.close.assert_awaited_once()
+        assert proc.is_alive is False
+
+    async def test_hard_timeout_fires_when_sdk_inactivity_timer_never_does(
+        self, tmp_path: Path
+    ) -> None:
+        """A turn stuck in a retry/progress loop keeps the SDK's sliding
+        inactivity window alive indefinitely (observed live: a Slack
+        thread wedged ~44h). The outer wait_for must still cut it off,
+        close the connection, and mark the process dead so the pool
+        starts a fresh one on the thread's next message."""
+        import asyncio
+
+        proc = CodexProcess(workspace=tmp_path)
+        fake = _fake_client()
+
+        async def never_finishes(*args: object, **kwargs: object) -> MagicMock:
+            await asyncio.sleep(3600)
+            return _chat_result("t1", "should never get here")
+
+        fake.chat_once.side_effect = never_finishes
+        with patch("bender.codex_process.CodexClient.connect_stdio", return_value=fake):
+            await proc.start()
+            with pytest.raises(CodexProcessError, match="hard cap"):
+                await proc.send("hi", timeout=0.05)
+
+        fake.close.assert_awaited_once()
+        assert proc.is_alive is False
 
     async def test_uses_stripped_subprocess_env(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

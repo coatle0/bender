@@ -91,13 +91,29 @@ class CodexProcess:
                 self.workspace,
             )
             try:
-                result = await self._client.chat_once(
-                    prompt,
-                    thread_id=self.session_id,
-                    thread_config=_THREAD_CONFIG,
-                    inactivity_timeout=timeout,
+                # The SDK's own inactivity_timeout is a sliding window: it
+                # resets on every turn event, not just the final one. A
+                # turn stuck in a retry/progress loop keeps producing
+                # events and can run for hours without ever tripping it --
+                # observed live as a thread wedged for ~44h. wait_for adds
+                # a hard cap on top, bounded by wall-clock time from the
+                # start of the call regardless of intermediate activity.
+                result = await asyncio.wait_for(
+                    self._client.chat_once(
+                        prompt,
+                        thread_id=self.session_id,
+                        thread_config=_THREAD_CONFIG,
+                        inactivity_timeout=timeout,
+                    ),
+                    timeout=timeout,
                 )
+            except asyncio.TimeoutError as exc:
+                await self._force_close_after_timeout()
+                raise CodexProcessError(
+                    f"Codex turn timed out after {timeout}s (hard cap)"
+                ) from exc
             except CodexTimeoutError as exc:
+                await self._force_close_after_timeout()
                 raise CodexProcessError(f"Codex turn timed out after {timeout}s") from exc
             except CodexError as exc:
                 raise CodexProcessError(f"codex app-server turn failed: {exc}") from exc
@@ -106,6 +122,25 @@ class CodexProcess:
             if not result.final_text:
                 raise CodexProcessError("Codex produced no agent_message")
             return result.final_text
+
+    async def _force_close_after_timeout(self) -> None:
+        """Tear down a wedged connection after a hard timeout.
+
+        CodexProcessError is a ProcessError, which ProcessPool.send()
+        catches by evicting this instance so the thread's next message
+        starts a fresh one. Without this, the old app-server subprocess
+        (and whatever turn state the SDK still holds for it) would be
+        orphaned instead of terminated -- clearing _client also makes
+        is_alive report False immediately, rather than leaving the pool
+        able to reuse a connection this call just gave up on.
+        """
+        client, self._client = self._client, None
+        if client is None:
+            return
+        try:
+            await client.close()
+        except Exception:
+            logger.warning("Failed to close wedged Codex client after timeout", exc_info=True)
 
     async def close(self) -> None:
         """Close the app-server connection, terminating its subprocess."""
