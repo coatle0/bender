@@ -83,6 +83,84 @@ class TestHandleMention:
         pool.send.assert_called_once_with("1234567890.000001", "check the logs")
         mock_say.assert_called_once_with(text="Logs look fine", thread_ts="1234567890.000001")
 
+    async def test_mention_reply_in_tracked_thread_uses_parent_thread_ts(
+        self,
+        setup_handler,
+        session_manager: SessionManager,
+        pool: AsyncMock,
+        mock_say: AsyncMock,
+    ) -> None:
+        """A mention posted as a reply inside an already-tracked thread
+        must route to the thread's parent ts, not its own -- using its
+        own ts here would silently fork off a disconnected new session.
+        Observed live: a threaded "ACK 필요" reminder became its own
+        isolated thread and Codex never saw the request it referred to."""
+        parent_ts = "1000000000.000001"
+        reply_ts = "1000000000.500002"
+        await session_manager.create_session(parent_ts)  # thread already tracked
+
+        handler = setup_handler["app_mention"]
+        event = {
+            "text": "<@U12345> 위 요청 확인 바람. ACK 필요.",
+            "ts": reply_ts,
+            "thread_ts": parent_ts,
+            "channel": "C123",
+        }
+        pool.send.return_value = "ACK."
+
+        await handler(event=event, say=mock_say)
+
+        pool.send.assert_called_once_with(parent_ts, "위 요청 확인 바람. ACK 필요.")
+        say_kwargs = mock_say.call_args.kwargs
+        assert say_kwargs["thread_ts"] == parent_ts
+        assert say_kwargs["text"].startswith("ACK.")
+
+    async def test_mention_reply_in_untracked_thread_backfills_context(
+        self,
+        setup_handler,
+        session_manager: SessionManager,
+        pool: AsyncMock,
+        mock_say: AsyncMock,
+    ) -> None:
+        """A mention that's the *first* bot involvement in a thread, but
+        arrives as a reply partway through pre-existing (bot-free) thread
+        history, must pull that history in -- otherwise the prompt is
+        just the reply's own text, with no idea what it's about. This is
+        exactly what happened live: a request was posted, then a plain
+        reminder reply first mentioned the bot, and Codex only ever saw
+        the reminder."""
+        parent_ts = "2000000000.000001"
+        reply_ts = "2000000000.500002"
+        mock_client = AsyncMock()
+        mock_client.conversations_replies.return_value = {
+            "messages": [
+                {"ts": parent_ts, "text": "[요청] 1. 파일 확인 2. 귀속 확인"},
+                {"ts": reply_ts, "text": "<@U12345> 위 요청 확인 바람. ACK 필요."},
+            ]
+        }
+
+        handler = setup_handler["app_mention"]
+        event = {
+            "text": "<@U12345> 위 요청 확인 바람. ACK 필요.",
+            "ts": reply_ts,
+            "thread_ts": parent_ts,
+            "channel": "C123",
+        }
+        pool.send.return_value = "ACK, will do."
+
+        await handler(event=event, say=mock_say, client=mock_client)
+
+        mock_client.conversations_replies.assert_called_once_with(
+            channel="C123", ts=parent_ts, limit=50
+        )
+        sent_prompt = pool.send.call_args[0][1]
+        assert "[요청] 1. 파일 확인 2. 귀속 확인" in sent_prompt
+        assert "위 요청 확인 바람. ACK 필요." in sent_prompt
+        # The reply's own text (fetched back from the API) isn't
+        # double-counted as "prior" context -- only messages strictly
+        # before it are.
+        assert sent_prompt.count("위 요청 확인 바람") == 1
+
     async def test_mention_empty_text_responds_help(
         self, setup_handler, pool: AsyncMock, mock_say: AsyncMock
     ) -> None:

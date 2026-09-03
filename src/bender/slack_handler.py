@@ -29,16 +29,36 @@ def register_handlers(
         pass
 
     @app.event("app_mention")
-    async def handle_mention(event: dict, say) -> None:
+    async def handle_mention(event: dict, say, client=None) -> None:
         """Handle new @Bender mentions — starts (or reuses) the thread's
         long-lived Claude Code process."""
         text = _strip_mention(event.get("text", ""))
-        thread_ts = event.get("ts", "")
+        own_ts = event.get("ts", "")
+        # Slack sets thread_ts to the parent message's ts when this
+        # mention was posted as a *reply* inside an existing thread; it's
+        # absent when the mention itself starts a new thread. Using
+        # own_ts unconditionally here would treat every threaded
+        # reply-with-mention as a brand-new, disconnected session --
+        # observed live: a short "ACK 필요" reminder sent as a threaded
+        # reply became its own isolated thread, and Codex acknowledged
+        # the reminder with no idea what request it referred to, because
+        # it had never seen the actual request the reminder was about.
+        thread_ts = event.get("thread_ts") or own_ts
         channel = event.get("channel", "")
 
         if not text.strip():
             await say(text="How can I help?", thread_ts=thread_ts)
             return
+
+        if thread_ts != own_ts and not await sessions.has_session(thread_ts):
+            # First bot mention lands partway through a thread with
+            # history that predates the bot's involvement. Without this,
+            # the prompt sent below would be just this one reply's text
+            # in total isolation -- pull the thread's prior messages in
+            # so the first turn has the actual context.
+            prior = await _fetch_prior_thread_text(client, channel, thread_ts, own_ts)
+            if prior:
+                text = f"{prior}\n\n---\n\n{text}"
 
         logger.info("New mention in channel=%s thread=%s", channel, thread_ts)
 
@@ -92,6 +112,39 @@ def register_handlers(
 def _strip_mention(text: str) -> str:
     """Remove Slack mention tags (<@U...>, <@B...>, <@W...>) from the message text."""
     return re.sub(r"<@[UBW][A-Z0-9]+>", "", text).strip()
+
+
+async def _fetch_prior_thread_text(client, channel: str, thread_ts: str, before_ts: str) -> str:
+    """Fetch a thread's messages that predate before_ts, as a plain-text
+    transcript (oldest first, one message per line). Best-effort: a
+    missing client or a failed/empty fetch just means no context gets
+    prepended, not a hard failure of the mention itself."""
+    if client is None:
+        return ""
+    try:
+        resp = await client.conversations_replies(channel=channel, ts=thread_ts, limit=50)
+    except Exception:
+        logger.warning(
+            "Could not fetch prior thread history for context backfill (thread=%s)",
+            thread_ts,
+            exc_info=True,
+        )
+        return ""
+
+    cutoff = float(before_ts) if before_ts else float("inf")
+    lines = []
+    for msg in resp.get("messages", []):
+        msg_ts = msg.get("ts")
+        text = (msg.get("text") or "").strip()
+        if not msg_ts or not text:
+            continue
+        try:
+            if float(msg_ts) >= cutoff:
+                continue
+        except ValueError:
+            continue
+        lines.append(_strip_mention(text))
+    return "\n\n".join(lines)
 
 
 async def _post_response(say, text: str, thread_ts: str) -> None:
