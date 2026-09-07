@@ -22,12 +22,61 @@ import time
 from pathlib import Path
 
 from codex_app_server_sdk import CodexClient, ThreadConfig
-from codex_app_server_sdk.errors import CodexError, CodexTimeoutError
+from codex_app_server_sdk.errors import CodexError, CodexTimeoutError, CodexTransportError
+from codex_app_server_sdk.transport import StdioTransport
 
 from bender.claude_process import _subprocess_env
 from bender.errors import ProcessError
 
 logger = logging.getLogger(__name__)
+
+# codex_app_server_sdk's StdioTransport.connect() spawns the app-server
+# subprocess via asyncio.create_subprocess_exec() without a `limit`
+# kwarg, so its stdout StreamReader gets asyncio's default 64KiB
+# readline() limit -- and StdioTransport.recv() (transport.py) reads
+# each JSON-RPC line with stdout.readline() under that limit. A single
+# app-server line can embed a full tool result and exceed 64KiB, which
+# raises inside readline() and the SDK wraps it as the generic
+# CodexTransportError("failed reading from stdio transport") -- same
+# failure mode as the 64KiB stream-json line limit already fixed on
+# the Claude side (claude_process.py), just inside third-party code
+# this time. No public parameter exposes the limit (confirmed reading
+# transport.py/client.py directly, SDK v0.3.2 -- also the latest on
+# PyPI, so not a "just upgrade" fix). Observed live 3 times since
+# 2026-09-02, most recently after 64s of real work mid-turn.
+_CODEX_STDIO_LINE_LIMIT = 16 * 1024 * 1024
+
+
+async def _patched_stdio_connect(self: StdioTransport) -> None:
+    """Drop-in replacement for StdioTransport.connect() that adds
+    limit=_CODEX_STDIO_LINE_LIMIT. Duplicates the original method body
+    (SDK v0.3.2) rather than calling through to it, since there's no
+    hook to inject the extra kwarg otherwise -- if a future SDK version
+    changes this method, this patch will keep working but silently
+    miss whatever changed.
+    """
+    if self._proc is not None:
+        return
+    try:
+        self._proc = await asyncio.wait_for(
+            asyncio.create_subprocess_exec(
+                *self._command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                cwd=self._cwd,
+                env=self._env,
+                limit=_CODEX_STDIO_LINE_LIMIT,
+            ),
+            timeout=self._connect_timeout,
+        )
+    except Exception as exc:  # pragma: no cover
+        raise CodexTransportError(
+            f"failed to start stdio transport command: {self._command!r}"
+        ) from exc
+
+
+StdioTransport.connect = _patched_stdio_connect
 
 # 300s repeatedly proved too short for real multi-project audit-style
 # requests (observed live: a COO multi-project scan request hit this

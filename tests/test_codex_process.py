@@ -10,7 +10,13 @@ from codex_app_server_sdk.errors import (
     CodexTransportError,
 )
 
-from bender.codex_process import CODEX_EXECUTABLE, CodexProcess, CodexProcessError
+from bender.codex_process import (
+    _CODEX_STDIO_LINE_LIMIT,
+    _patched_stdio_connect,
+    CODEX_EXECUTABLE,
+    CodexProcess,
+    CodexProcessError,
+)
 
 
 def _fake_client(**chat_once_results: object) -> MagicMock:
@@ -231,3 +237,49 @@ class TestCodexProcessSend:
             await asyncio.gather(proc.send("a"), proc.send("b"))
 
         assert call_order == ["start", "end", "start", "end"]
+
+
+class TestStdioLineLimitPatch:
+    """codex_app_server_sdk's StdioTransport.connect() spawns the
+    app-server without a `limit` kwarg, so a single oversized JSON-RPC
+    line (a full tool result embedded in one line, same failure mode as
+    the 64KiB stream-json line limit already fixed on the Claude side)
+    raises inside stdout.readline() and surfaces as the generic
+    CodexTransportError("failed reading from stdio transport") --
+    observed live 3 times. codex_process patches StdioTransport.connect
+    at import time; these tests confirm the patch is actually installed
+    and that it actually raises the stdout reader's limit, not just
+    that it runs without erroring."""
+
+    def test_patch_is_installed_on_import(self) -> None:
+        from codex_app_server_sdk.transport import StdioTransport
+
+        assert StdioTransport.connect is _patched_stdio_connect
+
+    async def test_patched_connect_raises_stdout_reader_limit(self) -> None:
+        from codex_app_server_sdk.transport import StdioTransport
+
+        transport = StdioTransport(["cmd.exe", "/c", "echo hi"])
+        await transport.connect()
+        try:
+            assert transport._proc is not None
+            assert transport._proc.stdout is not None
+            assert transport._proc.stdout._limit == _CODEX_STDIO_LINE_LIMIT
+        finally:
+            transport._proc.kill()
+            await transport._proc.wait()
+
+    async def test_patched_connect_is_a_noop_if_already_connected(self, tmp_path: Path) -> None:
+        """Matches the original method's behavior: calling connect() twice
+        must not spawn a second subprocess."""
+        from codex_app_server_sdk.transport import StdioTransport
+
+        transport = StdioTransport(["cmd.exe", "/c", "echo hi"])
+        await transport.connect()
+        first_proc = transport._proc
+        try:
+            await transport.connect()
+            assert transport._proc is first_proc
+        finally:
+            first_proc.kill()
+            await first_proc.wait()
