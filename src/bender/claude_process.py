@@ -19,7 +19,12 @@ from bender.errors import ProcessError
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TURN_TIMEOUT_SECONDS = 300
+# 300s repeatedly proved too short for real multi-project audit-style
+# requests (observed live: legitimate turns already running 170-190s,
+# and a COO multi-project scan request hit the hard cap at ~300s twice
+# in a row while still doing real work, 40+ tool calls and 700k+ tokens
+# in). Bumped by 5 minutes rather than guessing at a much larger number.
+DEFAULT_TURN_TIMEOUT_SECONDS = 600
 
 # How many trailing stderr lines to keep for error reporting. Unbounded
 # retention isn't needed -- this only ever surfaces in the "process exited

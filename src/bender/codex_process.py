@@ -29,7 +29,12 @@ from bender.errors import ProcessError
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TURN_TIMEOUT_SECONDS = 300
+# 300s repeatedly proved too short for real multi-project audit-style
+# requests (observed live: a COO multi-project scan request hit this
+# hard cap at ~300s twice in a row while still doing real work, 40+
+# tool calls and 700k+ tokens in). Bumped by 5 minutes rather than
+# guessing at a much larger number.
+DEFAULT_TURN_TIMEOUT_SECONDS = 600
 CODEX_EXECUTABLE = "codex.cmd"
 
 # Matches the bypassPermissions choice made for the Claude backend: MCP
