@@ -2,6 +2,7 @@
 
 import logging
 import re
+from collections import OrderedDict
 
 from slack_bolt.async_app import AsyncApp
 
@@ -12,11 +13,37 @@ from bender.slack_utils import SLACK_MSG_LIMIT, md_to_mrkdwn, split_text
 
 logger = logging.getLogger(__name__)
 
+# How many (channel, ts) pairs to remember for dedup. Only needs to cover
+# messages that could still have their duplicate event in flight, not
+# Bender's whole lifetime -- bounded so long uptime doesn't leak memory.
+_SEEN_EVENT_CACHE_SIZE = 200
+
 
 def register_handlers(
     app: AsyncApp, sessions: SessionManager, pool: ProcessPool
 ) -> None:
     """Register Slack event handlers on the bolt app."""
+
+    # Slack delivers both an `app_mention` and a `message` event for one
+    # physical message that's a threaded reply containing a mention --
+    # without this, handle_mention and handle_message both fire for the
+    # same message and both call pool.send() for the same thread_ts,
+    # racing ProcessPool._get_or_start() and orphaning a process that
+    # runs to its own timeout untracked (observed live: an immediate
+    # "thread not found" failure followed ten minutes later by an
+    # unrelated-looking timeout for the same thread). (channel, ts)
+    # identifies the physical Slack message identically across both
+    # event types, so whichever handler runs first claims it.
+    _seen_events: OrderedDict[tuple[str, str], None] = OrderedDict()
+
+    def _already_handled(channel: str, ts: str) -> bool:
+        key = (channel, ts)
+        if key in _seen_events:
+            return True
+        _seen_events[key] = None
+        if len(_seen_events) > _SEEN_EVENT_CACHE_SIZE:
+            _seen_events.popitem(last=False)
+        return False
 
     @app.event("reaction_added")
     async def handle_reaction_added(event: dict) -> None:
@@ -32,8 +59,12 @@ def register_handlers(
     async def handle_mention(event: dict, say, client=None) -> None:
         """Handle new @Bender mentions — starts (or reuses) the thread's
         long-lived Claude Code process."""
-        text = _strip_mention(event.get("text", ""))
         own_ts = event.get("ts", "")
+        channel = event.get("channel", "")
+        if _already_handled(channel, own_ts):
+            return
+
+        text = _strip_mention(event.get("text", ""))
         # Slack sets thread_ts to the parent message's ts when this
         # mention was posted as a *reply* inside an existing thread; it's
         # absent when the mention itself starts a new thread. Using
@@ -44,7 +75,6 @@ def register_handlers(
         # the reminder with no idea what request it referred to, because
         # it had never seen the actual request the reminder was about.
         thread_ts = event.get("thread_ts") or own_ts
-        channel = event.get("channel", "")
 
         if not text.strip():
             await say(text="How can I help?", thread_ts=thread_ts)
@@ -85,6 +115,11 @@ def register_handlers(
         if event.get("bot_id") or event.get("subtype"):
             return
 
+        channel = event.get("channel", "")
+        own_ts = event.get("ts", "")
+        if _already_handled(channel, own_ts):
+            return
+
         thread_ts = event.get("thread_ts")
         if not thread_ts:
             # Not a thread reply, ignore
@@ -98,7 +133,6 @@ def register_handlers(
         if not text.strip():
             return
 
-        channel = event.get("channel", "")
         logger.info("Thread reply in channel=%s thread=%s", channel, thread_ts)
 
         try:

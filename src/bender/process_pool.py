@@ -70,6 +70,7 @@ class ProcessPool:
         self._processes: dict[str, ThreadBackend] = {}
         self._last_used: dict[str, float] = {}
         self._lock = asyncio.Lock()
+        self._thread_locks: dict[str, asyncio.Lock] = {}
         self._reap_task: asyncio.Task | None = None
 
     def start_reaper(self) -> None:
@@ -127,27 +128,47 @@ class ProcessPool:
         return result
 
     async def _get_or_start(self, thread_ts: str) -> ThreadBackend:
+        # Slack delivers both an `app_mention` and a `message` event for
+        # one physical message that's a threaded reply containing a
+        # mention, and slack_handler.py dispatches both to pool.send().
+        # Without per-thread serialization here, both concurrent calls
+        # would see "no live process yet" under the lock below, release
+        # it, and each build + start their own backend connection
+        # resuming the same persisted session_id -- the codex app-server
+        # then rejects the second concurrent resume with "thread not
+        # found", and the loser of the self._processes[thread_ts] write
+        # race becomes an orphaned, untracked process that keeps running
+        # its own send() until it independently hits the turn timeout
+        # (observed live: a "thread not found" failure immediately
+        # followed ten minutes later by an unrelated-looking timeout for
+        # the same thread). Holding one lock per thread_ts across the
+        # entire check-create-register sequence makes the second caller
+        # simply wait for the first's result instead of racing it.
         async with self._lock:
+            thread_lock = self._thread_locks.setdefault(thread_ts, asyncio.Lock())
+
+        async with thread_lock:
             existing = self._processes.get(thread_ts)
             if existing is not None and existing.is_alive:
-                self._last_used[thread_ts] = time.monotonic()
+                async with self._lock:
+                    self._last_used[thread_ts] = time.monotonic()
                 return existing
 
-        existing_session_id = await self._sessions.get_session(thread_ts)
-        if self._backend == "codex":
-            proc: ThreadBackend = CodexProcess(
-                workspace=self._workspace, session_id=existing_session_id, thread_ts=thread_ts
-            )
-        else:
-            proc = ClaudeProcess(
-                workspace=self._workspace, session_id=existing_session_id, thread_ts=thread_ts
-            )
-        await proc.start(resume=existing_session_id is not None)
+            existing_session_id = await self._sessions.get_session(thread_ts)
+            if self._backend == "codex":
+                proc: ThreadBackend = CodexProcess(
+                    workspace=self._workspace, session_id=existing_session_id, thread_ts=thread_ts
+                )
+            else:
+                proc = ClaudeProcess(
+                    workspace=self._workspace, session_id=existing_session_id, thread_ts=thread_ts
+                )
+            await proc.start(resume=existing_session_id is not None)
 
-        async with self._lock:
-            self._processes[thread_ts] = proc
-            self._last_used[thread_ts] = time.monotonic()
-        return proc
+            async with self._lock:
+                self._processes[thread_ts] = proc
+                self._last_used[thread_ts] = time.monotonic()
+            return proc
 
     async def _reap_loop(self) -> None:
         while True:
@@ -165,6 +186,12 @@ class ProcessPool:
             to_close = [(ts, self._processes.pop(ts)) for ts in stale if ts in self._processes]
             for thread_ts, _ in to_close:
                 self._last_used.pop(thread_ts, None)
+                # Safe to drop even if a coroutine is mid-wait on this
+                # Lock object: dropping it from the dict only affects
+                # future _get_or_start calls, which will create a fresh
+                # Lock via setdefault; anyone already holding a reference
+                # to this one is unaffected.
+                self._thread_locks.pop(thread_ts, None)
         for thread_ts, proc in to_close:
             logger.info("Reaping idle Claude process for thread %s", thread_ts)
             await proc.close()

@@ -146,6 +146,39 @@ class TestSend:
 
         assert await sessions.get_session("thread-5") is None
 
+    async def test_concurrent_calls_for_same_new_thread_construct_only_one_process(
+        self, pool: ProcessPool
+    ) -> None:
+        """Two concurrent send() calls for a thread with no live process
+        yet (the app_mention + message double-dispatch scenario) must not
+        each construct their own backend connection and race to resume
+        the same persisted session -- only one process should ever be
+        created for a given thread_ts, and the second caller should just
+        wait for and reuse the first's result. Before the per-thread lock
+        in _get_or_start, both concurrent calls would see "no live
+        process yet", each build + start their own ClaudeProcess/
+        CodexProcess, and the loser of the self._processes[thread_ts]
+        write race would become an orphaned, untracked process."""
+        import asyncio
+
+        instance = _mock_claude_process()
+
+        async def slow_start(resume: bool = False) -> None:
+            await asyncio.sleep(0.01)
+
+        instance.start = AsyncMock(side_effect=slow_start)
+
+        with patch("bender.process_pool.ClaudeProcess", return_value=instance) as ctor:
+            results = await asyncio.gather(
+                pool.send("thread-race", "first"),
+                pool.send("thread-race", "second"),
+            )
+
+        ctor.assert_called_once()
+        instance.start.assert_called_once_with(resume=False)
+        assert results == ["reply", "reply"]
+        assert instance.send.await_count == 2
+
     async def test_independent_threads_get_independent_processes(
         self, pool: ProcessPool
     ) -> None:
