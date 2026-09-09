@@ -12,6 +12,11 @@ from bender.slack_utils import SLACK_MSG_LIMIT, md_to_mrkdwn, split_text
 
 logger = logging.getLogger(__name__)
 
+# Single-workspace deployment -- the channel IDs elsewhere in this codebase
+# are hardcoded the same way. Used only to build a message permalink, not
+# for any API call.
+_SLACK_WORKSPACE_DOMAIN = "vsurfcapital"
+
 
 def register_handlers(
     app: AsyncApp, sessions: SessionManager, pool: ProcessPool
@@ -32,8 +37,9 @@ def register_handlers(
     async def handle_mention(event: dict, say, client=None) -> None:
         """Handle new @Bender mentions — starts (or reuses) the thread's
         long-lived Claude Code process."""
-        text = _strip_mention(event.get("text", ""))
         own_ts = event.get("ts", "")
+        text = _strip_mention(event.get("text", ""))
+        text = _append_file_info(text, event.get("files"), event.get("channel", ""), own_ts)
         # Slack sets thread_ts to the parent message's ts when this
         # mention was posted as a *reply* inside an existing thread; it's
         # absent when the mention itself starts a new thread. Using
@@ -95,6 +101,9 @@ def register_handlers(
             return
 
         text = _strip_mention(event.get("text", ""))
+        text = _append_file_info(
+            text, event.get("files"), event.get("channel", ""), event.get("ts", "")
+        )
         if not text.strip():
             return
 
@@ -112,6 +121,31 @@ def register_handlers(
 def _strip_mention(text: str) -> str:
     """Remove Slack mention tags (<@U...>, <@B...>, <@W...>) from the message text."""
     return re.sub(r"<@[UBW][A-Z0-9]+>", "", text).strip()
+
+
+def _append_file_info(text: str, files: list[dict] | None, channel: str, ts: str) -> str:
+    """When the triggering event has attachments, append a permalink to
+    *this message* (not a per-file link) so the recipient (Claude/Codex)
+    can open it in Slack and pull the file itself via its own Slack tools,
+    rather than being handed a raw file_id it may not reliably know what
+    to do with.
+
+    Only files attached to *this* message are picked up -- files posted as
+    separate earlier replies in the same thread are not collected. That's
+    a deliberate simplification (by design, not a fallback): the sender is
+    expected to attach files to the same message as the request, rather
+    than spreading them across multiple thread replies with a bare mention
+    at the end. Without this, a caller has no reference to the attachment
+    at all -- observed live: a short "첨부된 md 파일 저장해줘" mention with
+    no file reference in the text resulted in Codex finding and moving an
+    unrelated pre-existing local file instead of ever fetching the real
+    attachment.
+    """
+    if not files or not channel or not ts:
+        return text
+    permalink = f"https://{_SLACK_WORKSPACE_DOMAIN}.slack.com/archives/{channel}/p{ts.replace('.', '')}"
+    appendix = f"[첨부 파일] {permalink}"
+    return f"{text}\n\n{appendix}" if text.strip() else appendix
 
 
 async def _fetch_prior_thread_text(client, channel: str, thread_ts: str, before_ts: str) -> str:

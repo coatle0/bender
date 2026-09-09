@@ -6,7 +6,7 @@ import pytest
 
 from bender.claude_process import ClaudeProcessError
 from bender.session_manager import SessionManager
-from bender.slack_handler import _strip_mention, register_handlers
+from bender.slack_handler import _append_file_info, _strip_mention, register_handlers
 
 
 class TestStripMention:
@@ -39,6 +39,37 @@ class TestStripMention:
     def test_removes_workspace_mention(self) -> None:
         """Removes <@WXXXX> workspace mentions."""
         assert _strip_mention("<@W12345ABC> hello") == "hello"
+
+
+class TestAppendFileInfo:
+    """Tests for the _append_file_info helper."""
+
+    def test_no_files_returns_text_unchanged(self) -> None:
+        assert _append_file_info("hello", None, "C123", "111.222") == "hello"
+        assert _append_file_info("hello", [], "C123", "111.222") == "hello"
+
+    def test_files_appends_message_permalink(self) -> None:
+        result = _append_file_info(
+            "저장해줘", [{"id": "F123", "name": "x.md"}], "C0BTE2228TB", "1788942600.437849"
+        )
+        assert result == (
+            "저장해줘\n\n[첨부 파일] "
+            "https://vsurfcapital.slack.com/archives/C0BTE2228TB/p1788942600437849"
+        )
+
+    def test_files_with_empty_text_returns_just_the_link(self) -> None:
+        """A bare mention with only a file attached (no other text) still
+        gets a usable prompt -- not an empty string that would trigger the
+        generic 'How can I help?' reply."""
+        result = _append_file_info("", [{"id": "F123", "name": "x.md"}], "C123", "111.222")
+        assert result == "[첨부 파일] https://vsurfcapital.slack.com/archives/C123/p111222"
+
+    def test_missing_channel_or_ts_returns_text_unchanged(self) -> None:
+        """Can't build a permalink without both -- fail open rather than
+        emit a broken link."""
+        files = [{"id": "F123", "name": "x.md"}]
+        assert _append_file_info("hi", files, "", "111.222") == "hi"
+        assert _append_file_info("hi", files, "C123", "") == "hi"
 
 
 @pytest.fixture
@@ -82,6 +113,30 @@ class TestHandleMention:
 
         pool.send.assert_called_once_with("1234567890.000001", "check the logs")
         mock_say.assert_called_once_with(text="Logs look fine", thread_ts="1234567890.000001")
+
+    async def test_mention_with_attachment_includes_message_permalink(
+        self, setup_handler, pool: AsyncMock, mock_say: AsyncMock
+    ) -> None:
+        """A mention with a file attached passes a permalink to the
+        triggering message, not just the bare request text -- otherwise
+        the recipient has no reference to which file was meant."""
+        handler = setup_handler["app_mention"]
+        event = {
+            "text": "<@U12345> 첨부된 md 파일 저장해줘",
+            "ts": "1788942600.437849",
+            "channel": "C0BTE2228TB",
+            "files": [{"id": "F0C0JNNF1V0", "name": "report.md"}],
+        }
+        pool.send.return_value = "done"
+
+        await handler(event=event, say=mock_say)
+
+        sent_prompt = pool.send.call_args[0][1]
+        assert "첨부된 md 파일 저장해줘" in sent_prompt
+        assert (
+            "https://vsurfcapital.slack.com/archives/C0BTE2228TB/p1788942600437849"
+            in sent_prompt
+        )
 
     async def test_mention_reply_in_tracked_thread_uses_parent_thread_ts(
         self,
