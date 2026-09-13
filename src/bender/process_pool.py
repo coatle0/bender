@@ -30,6 +30,19 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_IDLE_TIMEOUT_SECONDS = 15 * 60
 DEFAULT_REAP_INTERVAL_SECONDS = 60
+# A brand-new thread's first message pays a full cold start: the backend
+# subprocess connects every configured MCP server (observed live: 7 servers
+# for one workspace) before it can even accept a turn. That's fine for one
+# thread at a time, but a burst of unrelated @mentions landing within the
+# same few seconds each starts its own subprocess concurrently, and those
+# cold starts compete for the same CPU/network/shared MCP session state
+# (e.g. a single-connection MTProto session). Observed live: three new
+# threads mentioned within 4 minutes, one of the three subprocesses never
+# got far enough into its own startup to emit anything at all and sat dead
+# until the turn timeout fired 600s later. Capping how many *starts*
+# (not turns -- already-live processes still run fully in parallel) may
+# happen at once turns that contention into a short queue instead.
+DEFAULT_MAX_CONCURRENT_STARTS = 2
 VALID_BACKENDS = ("claude", "codex")
 
 
@@ -59,6 +72,7 @@ class ProcessPool:
         backend: str = "claude",
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT_SECONDS,
         reap_interval: float = DEFAULT_REAP_INTERVAL_SECONDS,
+        max_concurrent_starts: int = DEFAULT_MAX_CONCURRENT_STARTS,
     ) -> None:
         if backend not in VALID_BACKENDS:
             raise ValueError(f"backend must be one of {VALID_BACKENDS}, got {backend!r}")
@@ -71,6 +85,7 @@ class ProcessPool:
         self._last_used: dict[str, float] = {}
         self._lock = asyncio.Lock()
         self._thread_locks: dict[str, asyncio.Lock] = {}
+        self._start_semaphore = asyncio.Semaphore(max_concurrent_starts)
         self._reap_task: asyncio.Task | None = None
 
     def start_reaper(self) -> None:
@@ -163,7 +178,8 @@ class ProcessPool:
                 proc = ClaudeProcess(
                     workspace=self._workspace, session_id=existing_session_id, thread_ts=thread_ts
                 )
-            await proc.start(resume=existing_session_id is not None)
+            async with self._start_semaphore:
+                await proc.start(resume=existing_session_id is not None)
 
             async with self._lock:
                 self._processes[thread_ts] = proc

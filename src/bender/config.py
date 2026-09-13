@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     bender_api_port: int = 8080
     bender_db_path: Path = Path.cwd() / "bender_sessions.sqlite3"
     bender_backend: str = "claude"  # "claude" or "codex"
+    # Caps how many brand-new-thread subprocess cold starts may run at once;
+    # already-live processes are unaffected and keep running turns fully in
+    # parallel. See DEFAULT_MAX_CONCURRENT_STARTS in process_pool.py.
+    bender_max_concurrent_starts: int = 2
     log_level: str = "info"
 
     # Optional: API key for authenticating external HTTP requests

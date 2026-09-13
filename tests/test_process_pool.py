@@ -195,6 +195,102 @@ class TestSend:
         assert pool._processes["thread-b"] is instance_b
 
 
+class TestConcurrentStarts:
+    async def test_concurrent_new_threads_serialize_on_start_when_limited(
+        self, tmp_path: Path, sessions: SessionManager
+    ) -> None:
+        """Two independent new threads mentioned at nearly the same time must
+        not run their subprocess cold starts concurrently when the pool is
+        configured with max_concurrent_starts=1 -- each start() pays the full
+        per-thread MCP handshake cost, and letting an unbounded number run at
+        once is what let a burst of unrelated @mentions starve each other's
+        startup (observed live: one of three concurrent cold starts never got
+        past its own MCP handshake and sat dead for the full 600s turn
+        timeout). Already-live processes are unaffected: only start() is
+        gated, not send()."""
+        import asyncio
+
+        pool = ProcessPool(
+            workspace=tmp_path,
+            sessions=sessions,
+            idle_timeout=999,
+            reap_interval=999,
+            max_concurrent_starts=1,
+        )
+
+        in_flight = 0
+        peak = 0
+
+        async def tracked_start(resume: bool = False) -> None:
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.02)
+            in_flight -= 1
+
+        instance_a = _mock_claude_process(session_id="a")
+        instance_a.start = AsyncMock(side_effect=tracked_start)
+        instance_b = _mock_claude_process(session_id="b")
+        instance_b.start = AsyncMock(side_effect=tracked_start)
+
+        with patch(
+            "bender.process_pool.ClaudeProcess", side_effect=[instance_a, instance_b]
+        ):
+            await asyncio.gather(
+                pool.send("thread-a", "hi"),
+                pool.send("thread-b", "hi"),
+            )
+
+        assert peak == 1
+
+    async def test_concurrent_new_threads_overlap_when_limit_allows(
+        self, tmp_path: Path, sessions: SessionManager
+    ) -> None:
+        """The default limit (2) lets two independent new threads' cold
+        starts overlap -- the cap only kicks in once more starts are
+        in-flight than the configured limit."""
+        import asyncio
+
+        pool = ProcessPool(
+            workspace=tmp_path,
+            sessions=sessions,
+            idle_timeout=999,
+            reap_interval=999,
+        )
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        first_in = False
+
+        async def tracked_start(resume: bool = False) -> None:
+            nonlocal first_in
+            if not first_in:
+                first_in = True
+                started.set()
+                await release.wait()
+            else:
+                started.set()
+
+        instance_a = _mock_claude_process(session_id="a")
+        instance_a.start = AsyncMock(side_effect=tracked_start)
+        instance_b = _mock_claude_process(session_id="b")
+        instance_b.start = AsyncMock(side_effect=tracked_start)
+
+        with patch(
+            "bender.process_pool.ClaudeProcess", side_effect=[instance_a, instance_b]
+        ):
+            task_a = asyncio.create_task(pool.send("thread-a", "hi"))
+            await started.wait()
+            started.clear()
+            task_b = asyncio.create_task(pool.send("thread-b", "hi"))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            release.set()
+            await asyncio.gather(task_a, task_b)
+
+        instance_a.start.assert_awaited_once()
+        instance_b.start.assert_awaited_once()
+
+
 class TestBackendSelection:
     def test_rejects_unknown_backend(self, tmp_path: Path, sessions: SessionManager) -> None:
         with pytest.raises(ValueError, match="backend"):

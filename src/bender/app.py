@@ -43,6 +43,7 @@ def create_app(settings: Settings) -> BenderApp:
         workspace=settings.bender_workspace,
         sessions=sessions,
         backend=settings.bender_backend,
+        max_concurrent_starts=settings.bender_max_concurrent_starts,
     )
 
     # Slack bolt app (Socket Mode)
