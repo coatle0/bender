@@ -36,6 +36,11 @@ build/
 *.sqlite3-shm
 *.sqlite3-wal
 
+# Runtime logs
+bender_boot.log
+codexy.log
+codexy_boot.log
+
 # OS
 .DS_Store
 Thumbs.db
